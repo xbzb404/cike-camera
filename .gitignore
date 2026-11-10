@@ -1,0 +1,22 @@
+# 构建产物
+build/*.apk
+build/*.idsig
+build/out/
+build/tmp/
+
+# 签名材料（绝不入库）
+*.keystore
+*.jks
+*.p12
+keystore.properties
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+node_modules/

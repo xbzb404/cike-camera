@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="此刻相机">
+<meta name="description" content="拍照自动添加时间、地点、经纬度、名称水印">
+<title>此刻相机</title>
+<link rel="icon" href="icons/icon.svg">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- 启动页 -->
+<div class="splash" id="splash">
+  <div class="splash-glow g1"></div>
+  <div class="splash-glow g2"></div>
+  <div class="splash-inner">
+    <div class="splash-mark">
+      <span class="splash-halo"></span>
+      <img class="splash-logo" src="icons/icon.svg" alt="">
+    </div>
+    <div class="splash-name">此刻相机</div>
+    <div class="splash-sub">签名水印 · 真实可验</div>
+    <div class="splash-dots"><i></i><i></i><i></i></div>
+  </div>
+</div>
+
+<div id="app">
+  <header class="topbar">
+    <button class="icon-btn" id="btnSettings" aria-label="设置">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+    </button>
+    <div class="brand">
+      <span class="brand-title">此刻相机</span>
+      <span class="brand-sub" id="geoStatus">定位中…</span>
+    </div>
+    <button class="icon-btn" id="btnSwitch" aria-label="切换摄像头">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v4"></path><path d="M9 21H5a2 2 0 0 1-2-2v-4"></path><path d="M21 9 14 2"></path><path d="M3 15l7 7"></path><path d="M14 2v5a2 2 0 0 0 2 2h5"></path><path d="M10 22v-5a2 2 0 0 0-2-2H3"></path></svg>
+    </button>
+  </header>
+
+  <main class="stage-wrap">
+   <div class="stage-col">
+    <div class="stage" id="stage">
+      <video id="video" playsinline autoplay muted></video>
+      <canvas id="overlay"></canvas>
+      <div class="lensbar" id="lensBar" hidden></div>
+
+      <div class="stage-guard" id="stageGuard">
+        <p id="guardText">正在启动相机…</p>
+        <button class="btn-primary" id="btnEnableCam">点击开启相机</button>
+      </div>
+    </div>
+
+    <div class="stylebar">
+     <button class="style-btn" id="btnStyle">
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="8" rx="2"></rect><rect x="13" y="3" width="8" height="8" rx="2"></rect><rect x="3" y="13" width="8" height="8" rx="2"></rect><rect x="13" y="13" width="8" height="8" rx="2"></rect></svg>
+      <span>水印样式</span>
+      <b id="styleName">经典</b>
+      <svg class="chev" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
+     </button>
+    </div>
+   </div>
+  </main>
+
+  <footer class="controls">
+    <button class="side-btn" id="btnGallery" aria-label="从相册选择">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><path d="m21 15-5-5L5 21"></path></svg>
+      <span>相册</span>
+    </button>
+
+    <button class="shutter" id="btnShutter" aria-label="拍照"><span></span></button>
+
+    <button class="side-btn" id="btnRelocate" aria-label="重新定位">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 12-9 12s-9-5-9-12a9 9 0 0 1 18 0Z"></path><circle cx="12" cy="10" r="3"></circle></svg>
+      <span>定位</span>
+    </button>
+  </footer>
+</div>
+
+<input type="file" id="fileInput" accept="image/*" hidden>
+
+<!-- 设置面板 -->
+<div class="sheet-mask" id="sheetMask"></div>
+<section class="sheet" id="sheet" aria-label="水印设置">
+  <div class="sheet-handle"></div>
+  <div class="sheet-head">
+    <h2>水印设置</h2>
+    <button class="text-btn" id="btnDone">完成</button>
+  </div>
+
+  <div class="sheet-body">
+    <label class="field">
+      <span class="field-label">名称 / 单位</span>
+      <input type="text" id="inpTitle" placeholder="例如：XX项目部 · 张三" maxlength="24">
+    </label>
+
+    <label class="field">
+      <span class="field-label">地点（留空则自动获取）</span>
+      <div class="field-row">
+        <input type="text" id="inpPlace" placeholder="自动定位地址" maxlength="30">
+        <button class="mini-btn" id="btnAutoPlace">用定位</button>
+      </div>
+    </label>
+
+    <label class="field">
+      <span class="field-label">高德 Web服务 Key（可选，填了地址精确到街道门牌）</span>
+      <input type="text" id="inpAmap" placeholder="在高德开放平台申请「Web服务」类型 Key" maxlength="64" autocomplete="off">
+    </label>
+
+    <div class="switch-list">
+      <label class="switch-item">
+        <span>显示时间</span>
+        <input type="checkbox" id="swTime"><i></i>
+      </label>
+      <label class="switch-item">
+        <span>显示秒</span>
+        <input type="checkbox" id="swSeconds"><i></i>
+      </label>
+      <label class="switch-item">
+        <span>显示地点</span>
+        <input type="checkbox" id="swPlace"><i></i>
+      </label>
+      <label class="switch-item">
+        <span>显示经纬度</span>
+        <input type="checkbox" id="swCoords"><i></i>
+      </label>
+      <label class="switch-item">
+        <span>经纬度用高德坐标（GCJ-02）</span>
+        <input type="checkbox" id="swGcj"><i></i>
+      </label>
+      <label class="switch-item">
+        <span>显示天气</span>
+        <input type="checkbox" id="swWeather"><i></i>
+      </label>
+      <label class="switch-item">
+        <span>显示验真码</span>
+        <input type="checkbox" id="swCode"><i></i>
+      </label>
+    </div>
+
+    <div class="sign-box">
+      <div class="sign-head">
+        <span>我的签名公钥指纹</span>
+        <button class="mini-btn" id="btnCopyFp">复制</button>
+      </div>
+      <code class="sign-fp" id="fpText">生成中…</code>
+      <p class="sign-tip">照片里带有数字签名。别人拿到照片后，用验真页核对这个指纹，就能确认照片确实由你这台设备签名、且文件未被改动。</p>
+      <a class="sign-link" href="verify.html" target="_blank" rel="noopener">打开验真页 →</a>
+    </div>
+
+    <p class="tip">提示：定位需要授权，且必须在 HTTPS 或本机环境下才可用。地址由地图服务解析，可能不准，可手动填写。</p>
+  </div>
+</section>
+
+<!-- 水印样式面板 -->
+<div class="sheet-mask" id="styleMask"></div>
+<section class="sheet sheet-style" id="styleSheet" aria-label="水印样式">
+  <div class="sheet-handle"></div>
+  <div class="sheet-head">
+    <h2>水印样式</h2>
+    <button class="text-btn" id="btnStyleDone">完成</button>
+  </div>
+  <div class="style-grid" id="styleGrid"></div>
+</section>
+
+<!-- 预览 -->
+<div class="preview" id="preview">
+  <button class="preview-close" id="btnClosePreview" aria-label="关闭">
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"></path></svg>
+  </button>
+  <div class="preview-scroll">
+    <img id="previewImg" alt="拍摄结果">
+  </div>
+  <p class="preview-code" id="previewCode"></p>
+  <p class="preview-hint" id="previewHint">点「保存到相册」；若没有自动保存，长按图片选择「存储图像」</p>
+  <div class="preview-bar">
+    <button class="btn-ghost" id="btnRetake">重拍</button>
+    <button class="btn-primary" id="btnSave">保存到相册</button>
+    <button class="btn-ghost" id="btnShare" hidden>分享</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="js/crypto-wmc.js"></script>
+<script src="js/exif.js"></script>
+<script src="js/native.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

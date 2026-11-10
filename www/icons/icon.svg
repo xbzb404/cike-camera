@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#222e42"/>
+      <stop offset="0.45" stop-color="#111722"/>
+      <stop offset="1" stop-color="#070a0f"/>
+    </linearGradient>
+    <radialGradient id="glowA" cx="0.2" cy="0.1" r="0.8">
+      <stop offset="0" stop-color="#6f9cff" stop-opacity="0.42"/>
+      <stop offset="0.5" stop-color="#4a6dff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#4a6dff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowB" cx="0.85" cy="0.95" r="0.75">
+      <stop offset="0" stop-color="#ffb648" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#ffb648" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0.45" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.20"/>
+      <stop offset="0.42" stop-color="#ffffff" stop-opacity="0.055"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.10"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0.55" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.40"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0.15" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#ffd98a"/>
+      <stop offset="0.5" stop-color="#ffc158"/>
+      <stop offset="1" stop-color="#ec9f33"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0.2" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.60"/>
+      <stop offset="0.42" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.24"/>
+    </linearGradient>
+    <filter id="softBlur" x="-45%" y="-45%" width="190%" height="190%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+    <filter id="sheenBlur" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="9"/>
+    </filter>
+    <filter id="dropShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+    <clipPath id="panelClip">
+      <rect x="104" y="104" width="304" height="304" rx="86"/>
+    </clipPath>
+  </defs>
+
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <rect width="512" height="512" fill="url(#glowA)"/>
+  <rect width="512" height="512" fill="url(#glowB)"/>
+
+  <!-- 雾面玻璃面板 -->
+  <g filter="url(#dropShadow)">
+    <rect x="104" y="104" width="304" height="304" rx="86" fill="url(#glass)"/>
+  </g>
+  <g clip-path="url(#panelClip)">
+    <ellipse cx="180" cy="158" rx="128" ry="98" fill="#ffffff" opacity="0.14" filter="url(#softBlur)"/>
+    <ellipse cx="336" cy="372" rx="118" ry="88" fill="#ffc158" opacity="0.12" filter="url(#softBlur)"/>
+    <path d="M96 300 L416 132 L416 206 L96 374 Z" fill="url(#sheen)" opacity="0.5" filter="url(#sheenBlur)"/>
+  </g>
+  <rect x="104" y="104" width="304" height="304" rx="86" fill="none" stroke="url(#rim)" stroke-width="2.2"/>
+
+  <!-- 相机 -->
+  <g>
+    <path d="M146 248 a34 34 0 0 1 34 -34 h16 v-13 a15 15 0 0 1 15 -15 h54 a15 15 0 0 1 15 15 v13 h16 a34 34 0 0 1 34 34 v82 a34 34 0 0 1 -34 34 H180 a34 34 0 0 1 -34 -34 z"
+          fill="url(#amber)"/>
+    <circle cx="258" cy="288" r="45" fill="#0c1119"/>
+    <circle cx="258" cy="288" r="45" fill="none" stroke="#ffe3a8" stroke-opacity="0.45" stroke-width="3"/>
+    <circle cx="258" cy="288" r="19" fill="url(#amber)"/>
+    <circle cx="246" cy="275" r="8" fill="#ffffff" opacity="0.5"/>
+    <circle cx="330" cy="244" r="8" fill="#0c1119" opacity="0.85"/>
+  </g>
+</svg>
