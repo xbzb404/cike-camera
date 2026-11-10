@@ -212,24 +212,30 @@ const LNG = 121.473701;
   ok('竖屏时水印用用户选的位置', port.portrait && port.eff === port.chosen,
     port.eff + ' / 选中 ' + port.chosen);
 
-  /* ---------- 横屏：水印自动挪到右上，避开工具条与快门 ---------- */
+  /* ---------- 横屏：水印留在用户选的同一个角，只是画面转过来 ---------- */
   await page.setViewportSize({ width: 900, height: 420 });
   await page.waitForTimeout(300);
   const lscape = await page.evaluate(() => ({
     land: isLandscape(),
     eff: effPos(),
-    auto: document.getElementById('swAutoPos').checked,
     stage: (() => {
       const r = document.getElementById('stage').getBoundingClientRect();
       return Math.round(r.width) + 'x' + Math.round(r.height);
+    })(),
+    ratio: (() => {
+      const r = document.getElementById('stage').getBoundingClientRect();
+      return +(r.width / r.height).toFixed(2);
     })()
   }));
   ok('横屏判定生效', lscape.land, 'stage ' + lscape.stage);
-  ok('横屏时水印自动挪到右上', lscape.land && lscape.eff === 'tr', lscape.eff + ' auto=' + lscape.auto);
+  ok('横屏时水印仍在用户选的同一个角', lscape.land && lscape.eff === port.chosen,
+    lscape.eff + ' / 竖屏 ' + port.chosen);
+  ok('横屏取景框是旋转后的 4:3，不是一条扁带', Math.abs(lscape.ratio - 4 / 3) < 0.05,
+    lscape.stage + ' ratio ' + lscape.ratio);
   await page.setViewportSize({ width: 430, height: 920 });
   await page.waitForTimeout(300);
   const back = await page.evaluate(() => ({ portrait: !isLandscape(), eff: effPos() }));
-  ok('转回竖屏后水印回到原位', back.portrait && back.eff === port.chosen, back.eff);
+  ok('转回竖屏后水印还在原位', back.portrait && back.eff === port.chosen, back.eff);
 
   /* ---------- 验真页闭环 ---------- */
   const vp = await ctx.newPage();

@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.4.9';
+const APP_VERSION = '1.5.0';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -35,7 +35,6 @@ const DEFAULTS = {
   amapKey: '',
   style: 'classic',
   pos: 'bl',            // bl | br | tl | tr（左下/右下/左上/右上）
-  autoPos: true,        // 横屏时自动把水印挪到空着的角落
   size: '1080',         // 预览流长边：720 | 1080 | 1440
   view: 'fill',         // fill 填满取景框（默认，取景框尽量大）| wide 完整视角
   full: false,          // 全屏取景（只能手动开，退出用右上角按钮）
@@ -52,7 +51,7 @@ const DEFAULTS = {
   showCode: true,
   coordFmt: 'zh',       // zh | dec
   coordGcj: false,
-  still: 'auto',        // 成片分辨率：auto | 12 | 8 | 5 | 2（单位 MP，4:3）
+  still: 'auto',        // 成片尺寸：auto | 长边像素（960/1280/1920/2560/3840，横竖拍像素数相同）
   smartPick: true,
   writeExif: true,
   jpegQuality: 0.94,
@@ -96,7 +95,6 @@ function readSettings() {
   if (Number(s.viewMigrated) < 2) { s.view = 'fill'; s.viewMigrated = 2; }
   if (!['fill', 'wide'].includes(s.view)) s.view = 'fill';
   // 老用户的设置里没有这个字段，必须显式补 true，否则 Object.assign 之后是 undefined
-  if (typeof s.autoPos !== 'boolean') s.autoPos = true;
   // EV 一律不继承历史值。
   // ------------------------------------------------------------
   // 这个字段是「硬件曝光补偿」，滑到 +2 就是实打实多曝两档，画面必白。
@@ -105,13 +103,15 @@ function readSettings() {
   // 曝光补偿属于「当下场景的临时判断」，不该跨会话记忆。
   s.ev = 0;
   if (!['auto', '0', '90', '270'].includes(String(s.videoRot))) s.videoRot = 'auto';
-  // 成片分辨率：旧版只有 high/standard 两档，等价迁到 auto / 2MP，
-  // 迁完即锁定，之后用户自己选什么就是什么。
+  // 成片尺寸：旧版只有 high/standard 两档，standard 等价迁到长边 960（≈0.7MP）。
   if (!s.stillMigrated) {
-    s.still = s.quality === 'standard' ? '2' : 'auto';
+    s.still = s.quality === 'standard' ? '960' : 'auto';
     s.stillMigrated = true;
   }
-  if (!['auto', '12', '8', '5', '2'].includes(String(s.still))) s.still = 'auto';
+  // 现在存的是档位 id（'12' / '4k' / '1080' / 'vga'…）。
+  // 老版本存的 12 / 8 / 5 / 2 正好也是新档位 id（12MP/8MP/5MP/2MP），
+  // 语义一致，直接沿用；其它认不出的值一律归 auto。
+  if (s.still !== 'auto' && !/^[0-9a-z]{1,4}$/i.test(String(s.still))) s.still = 'auto';
   // 1.4.8：窗口改成系统真旋转（fullSensor），画面方向由 display rotation
   // 决定。老版本里为了把躺倒的画面扳正而手动设过 90/270 的，一次性清回
   // auto，否则会和系统旋转叠成 180°（「UI 倒了 / 画面不跟着转」的源头之一）。
@@ -120,16 +120,47 @@ function readSettings() {
   return s;
 }
 
-/* 成片分辨率档位 → 目标像素尺寸。
-   统一按 4:3 折算：面积 = 12k²（4k × 3k），所以 k = √(MP / 12)。
+/* 成片尺寸档位。
+   ------------------------------------------------------------
+   全是摄像头真正会给出的标准 4:3 分辨率（这台相机的取景本来就是 3:4 /
+   4:3，用 16:9 的档位只会被裁成 4:3，名不副实，所以不列）。
+   列表按 `getCapabilities()` 报的最大分辨率过滤：设备给不到的档位不显示。
+   出片只约束「长边」—— 横拍 1920×1440、竖拍 1440×1920，像素一样多，
+   只是方向不同（大小固定，方向改变）。
    auto 返回 null，表示「设备能给多大就给多大」。 */
-const STILL_MP = { '12': 12, '8': 8, '5': 5, '2': 2 };
+const STILL_STEPS = [
+  { id: '12', name: '12MP', w: 4000, h: 3000 },
+  { id: '8', name: '8MP', w: 3264, h: 2448 },
+  { id: '5', name: '5MP', w: 2592, h: 1944 },
+  { id: '3', name: '3MP', w: 2048, h: 1536 },
+  { id: '2', name: '2MP', w: 1920, h: 1440 },
+  { id: '1', name: '1MP', w: 1280, h: 960 },
+  { id: 'vga', name: 'VGA', w: 640, h: 480 }
+];
+const STILL_DEFAULT = ['2', '1', 'vga'];
+
+function stillSteps() {
+  const capW = (caps.width && caps.width.max) || 0;
+  const capH = (caps.height && caps.height.max) || 0;
+  const capLong = Math.max(capW, capH);
+  const capPx = capW * capH;
+  // 摄像头还没打开（capabilities 为空）时先给一组最常用的标准档，
+  // 打开相机后按真实能力重建一次。
+  if (!capLong) return STILL_STEPS.filter(s => STILL_DEFAULT.includes(s.id));
+  return STILL_STEPS.filter(s => {
+    const long = Math.max(s.w, s.h);
+    // 长边压 4000：再大 WebView 的预览输出多半不支持，抓帧反而失败
+    if (long > Math.min(capLong, 4000)) return false;
+    // 像素总数也不能超过设备上限（避免 4K 这种宽高比不同导致的越界）
+    if (capPx && s.w * s.h > capPx * 1.02) return false;
+    return true;
+  }).sort((a, b) => b.w * b.h - a.w * a.h);
+}
 
 function stillTarget() {
-  const mp = STILL_MP[String(S.still)];
-  if (!mp) return null;
-  const k = Math.sqrt(mp * 1e6 / 12);
-  return { w: Math.round(4 * k), h: Math.round(3 * k), mp };
+  const st = STILL_STEPS.find(x => x.id === String(S.still));
+  if (!st) return null;
+  return { long: Math.max(st.w, st.h), w: st.w, h: st.h };
 }
 
 let S = readSettings();
@@ -342,6 +373,10 @@ let aspectFixKey = '';
 let streamFixTimer = 0;
 
 function streamConstraint() {
+  // 预览流固定要横版 4:3，不跟方向换成竖版。
+  // 原因：WebView 遇到「竖版请求」时会自己从传感器画面中心裁一块出来，
+  // 等效 1.8~2.4 倍数码变焦 —— 之前「视角比原生相机近一大截」就是这么来的。
+  // 竖拍要的竖版流只在按快门那一刻临时协商（见 grabHiRes），预览不受影响。
   let h = Number(S.size) || 1080;
   let w = Math.round(h * 4 / 3);
   if (streamFlip) { const t = w; w = h; h = t; }
@@ -444,6 +479,8 @@ async function startCamera(deviceId, opts) {
     await setupZoom(track);
 
     updateToolCaps();
+    // 摄像头开了才知道它真支持到多大，这时候重建一次「图片尺寸」档位
+    renderStillSeg();
     camStarting = false;
     // 首帧稳定后校验一次「流的方向和窗口方向是否一致」，不一致会自己修
     setTimeout(checkStreamOrient, 700);
@@ -1042,15 +1079,20 @@ function layoutStage() {
   }
   if (availW <= 0 || availH <= 0) return;
 
-  // 取景框要尽量大：
-  //   竖屏非全屏：固定 3:4（手机竖着拿的取景习惯），cover 填满；
-  //   横屏 / 全屏：整块铺满 —— 顶栏、工具条、快门都是浮层或独立一行，
-  //               画面能吃多少给多少。
+  // 取景框尺寸固定、方向跟着转 —— 不是「横屏就把框拉成一条扁带」。
+  //   竖屏：3:4，按宽度撑开；
+  //   横屏：4:3，就是竖屏那张框转 90°，按高度反算（宽度不会被拉满）；
+  //   全屏：铺满整屏（全屏本来就是「画面最大」的模式）。
   // 注意不是「按视频流比例排版」：那会让 4:3 的流在竖屏里缩成一条矮带。
   let w, h;
-  if (land || full) {
+  if (full) {
     w = availW;
     h = availH;
+  } else if (land) {
+    const targetR = 4 / 3;
+    h = availH;
+    w = h * targetR;
+    if (w > availW) { w = availW; h = w / targetR; }
   } else {
     const targetR = 3 / 4;
     w = availW;
@@ -1066,6 +1108,18 @@ function layoutStage() {
   stage.style.setProperty('--vsh', H + 'px');
   // 视野：wide 时 video 用 contain（整幅都看得见，代价是留边）
   stage.classList.toggle('view-wide', S.view === 'wide');
+
+  // 横屏非全屏：取景框 4:3 居中，左右必然留出黑边。黑边够宽时把工具条
+  // 搬进左边那块黑边（CSS 竖排），工具条就不再压在画面上 —— 界面不用
+  // 重排，画面也不用为它让位置。黑边不够（窄屏横放）就退回原来浮在左上。
+  if (land && !full) {
+    let leftRoom = 0;
+    try { leftRoom = stage.getBoundingClientRect().left; } catch (e) { leftRoom = 0; }
+    document.body.classList.toggle('side-bars', leftRoom >= 150);
+  } else {
+    document.body.classList.remove('side-bars');
+  }
+
   applyVideoTransform();
   renderOverlay();
 }
@@ -1075,12 +1129,13 @@ let uiCode = '';
 function isTopPos(p) { return p === 'top' || p === 'tl' || p === 'tr'; }
 function isRightPos(p) { return p === 'br' || p === 'tr'; }
 
-/* 水印最终落点。
-   横屏时画面变成宽幅，左下角被底部控制条压住、左上角被工具条压住，
-   右上角是唯一干净的角落 —— 手机横过来就自动挪过去，竖回去再挪回用户选的位置。 */
+/* 水印落点 = 用户选的那个角，旋转不改。
+   以前横屏会自动跳到右上角（因为工具条浮在左上、快门压在下边），
+   结果「右下角的水印转一下跑到右上角」，用户第一眼就看出不对。
+   现在横屏的工具条搬进了左侧黑边、快门在画面之外，贴角没人挡，
+   所以水印就老老实实待在同一个角 —— 旋转时唯一该变的就是画面和水印。 */
 function effPos() {
-  if (!S.autoPos) return S.pos;
-  return isLandscape() ? 'tr' : S.pos;
+  return S.pos;
 }
 
 /* 画面在取景框里实际占的那块矩形。
@@ -1128,19 +1183,23 @@ function renderOverlay() {
     try { ink = sampleVideoInk(pos); } catch (e) { ink = 'dark'; }
   }
   // 什么时候水印要给界面让位？
-  //   · 全屏：顶栏、工具条、快门全是浮层，压在画面上；
-  //   · 横屏：工具条浮在画面左上、快门条也在画面下方。
-  // 这两种情况贴角的水印会被压住，所以整体往画面里让一段。
-  // 竖屏非全屏时工具条在画面之外，不用让。
+  //   全屏：顶栏、工具条、快门全是浮层，压在画面上，贴角会被盖住；
+  //   非全屏：控件都在画面之外（横屏的工具条还搬进了左侧黑边），不用让。
+  // 以前横屏也整体平移，结果水印既换了角又缩了位置，看着很怪。
   ctx.save();
-  if (S.full || isLandscape()) {
+  if (S.full) {
     const topEl = $('.topbar'), botEl = $('.controls');
-    const topH = S.full && topEl ? topEl.offsetHeight : 0;
-    const botH = (S.full || isLandscape()) && botEl ? botEl.offsetHeight : 0;
+    const topH = topEl ? topEl.offsetHeight : 0;
+    const botH = botEl ? botEl.offsetHeight : 0;
     const shift = isTopPos(pos) ? topH + 12 : -(botH + 10);
     if (shift) ctx.translate(0, shift);
   }
-  WM.draw(ctx, W, H, d, { style: S.style, pos, scale: S.wmScale, ink, s: S });
+  // 预览水印按画面短边缩放（成片同一套算法）。横屏取景框短边只有 270 左右，
+  // 直接按比例算会比竖屏小一圈、贴角看着像「缩进角落的小字」。
+  // 给预览一个最小基准，横竖切过来水印视觉大小才一致（成片不受影响）。
+  const shortSide = Math.min(W, H) || 1;
+  const wmFix = shortSide < 340 ? 340 / shortSide : 1;
+  WM.draw(ctx, W, H, d, { style: S.style, pos, scale: S.wmScale * wmFix, ink, s: S });
   ctx.restore();
 }
 
@@ -1645,13 +1704,20 @@ async function grabHiRes(track, target) {
   if (!capW || !capH) return null;
 
   const curW = video.videoWidth || 0, curH = video.videoHeight || 0;
-  // auto（target 为 null）推到设备上限；指定档位就奔目标去。
-  // 上限压到 3000 高：再大 WebView 的预览输出多半不支持，协商失败反而更糟。
-  const bound = Math.min(capH, 3000);
-  const wantH = Math.min(bound, target ? Math.max(target.h, curH) : bound);
-  const wantW = Math.min(capW, Math.round(wantH * 4 / 3));
+  const curLong = Math.max(curW, curH);
+  // auto（target 为 null）推到设备上限；指定档位就奔目标长边去。
+  // 按当前取景方向要对应比例的流：竖拍要竖版（1440×1920），横拍要横版
+  // （1920×1440）—— 这样同一个档位横竖拍拿到的长边才一致。
+  // 上限压到 4000 宽 / 3000 高：再大 WebView 的预览输出多半不支持，
+  // 协商失败反而更糟。
+  const capLong = Math.min(capW, Math.round(capH * 4 / 3), 4000);
+  const wantLong = Math.min(capLong, target ? Math.max(target.long, curLong) : capLong);
+  const short = Math.round(wantLong * 3 / 4);
+  let wantW, wantH;
+  if (isLandscape()) { wantW = wantLong; wantH = short; }
+  else { wantW = short; wantH = wantLong; }
   // 提不上 20% 就没意义，别为几万像素折腾一次黑屏
-  if (wantW < curW * 1.2) return null;
+  if (wantLong < curLong * 1.2) return null;
 
   const prev = streamConstraint();
   const restore = async () => {
@@ -1675,12 +1741,14 @@ async function grabHiRes(track, target) {
       width: { ideal: wantW },
       height: { ideal: wantH }
     });
-    // 等 videoWidth 真的变了，最多 900ms
+    // 等长边真的变大了，最多 900ms。
+    // 按长边判断而不是 videoWidth：竖拍要的是 1440×1920，宽度比原来更小，
+    // 拿宽度做判据会永远等不到。
     const t0 = performance.now();
     let ok = false;
     while (performance.now() - t0 < 900) {
       await nextFrame();
-      if (video.videoWidth >= curW * 1.2) { ok = true; break; }
+      if (Math.max(video.videoWidth, video.videoHeight) >= curLong * 1.2) { ok = true; break; }
     }
     if (!ok) return null;
 
@@ -1728,8 +1796,8 @@ async function grabBestImage() {
   // ② 高分辨率：临时把约束推到目标档位（auto 就推到设备上限），抓完恢复。
   //    目标比当前预览还小时不必折腾 —— 预览帧本身就够，多缩一次只是多一道损失。
   const tgt = stillTarget();
-  const curH = video.videoHeight || 0;
-  if (!tgt || tgt.h > curH * 1.06) {
+  const curLong = Math.max(video.videoWidth || 0, video.videoHeight || 0);
+  if (!tgt || tgt.long > curLong * 1.06) {
     const hi = await grabHiRes(trackRef, tgt);
     if (hi) {
       return {
@@ -1804,13 +1872,18 @@ function composeCanvas(raw) {
 
   let outW = Math.round(zw);
   let outH = Math.round(zh);
-  // 用户指定了分辨率档位：只缩不放。
+  // 用户指定了尺寸档位：按「长边」约束，只缩不放。
+  // 横拍 1920×1440、竖拍 1440×1920 —— 同一个档位转 90°，像素数一样多。
   // 源图本身没那么多像素时放大只是把同样信息摊到更多格子上，看着更糊，
-  // 还骗自己「这是 12MP」。这种情况保持原尺寸，诊断里如实显示实际值。
+  // 还骗自己「这是 4K」。这种情况保持原尺寸，诊断里如实显示实际值。
   const tgt = stillTarget();
-  if (tgt && outW > tgt.w) {
-    outH = Math.round(outH * tgt.w / outW);
-    outW = tgt.w;
+  if (tgt) {
+    const long = Math.max(outW, outH);
+    if (long > tgt.long) {
+      const k = tgt.long / long;
+      outW = Math.round(outW * k);
+      outH = Math.round(outH * k);
+    }
   }
   const MAXW = 4096;
   if (outW > MAXW) {
@@ -2042,10 +2115,10 @@ async function capture() {
     lastRaw = cloneCanvas(canvas);   // 未套影调的构图，改水印时重算
     devDiag.out = canvas.width + 'x' + canvas.height;
     // 选了固定档位却拿不到那么多像素时，如实标出目标值 ——
-    // 否则用户会以为「12MP」生效了，实际只有设备能给的那点
+    // 否则用户会以为「4K」生效了，实际只有设备能给的那点
     const tgtS = stillTarget();
-    if (tgtS && canvas.width !== tgtS.w) {
-      devDiag.out += '（目标 ' + tgtS.w + 'x' + tgtS.h + '）';
+    if (tgtS && Math.abs(Math.max(canvas.width, canvas.height) - tgtS.long) > 2) {
+      devDiag.out += '（目标长边 ' + tgtS.long + '）';
     }
     devDiag.af = raw.afMs != null
       ? (raw.afMs + 'ms / ' + (raw.frames || 1) + '帧')
@@ -2546,7 +2619,7 @@ function syncUI() {
     swCoords: 'showCoords', swWeather: 'showWeather', swCode: 'showCode',
     swGcj: 'coordGcj', swAlt: 'showAltitude', swAcc: 'showAccuracy',
     swInk: 'autoInk', swExif: 'writeExif', swSmart: 'smartPick', swGrid: 'grid',
-    swTone: 'autoTone', swAutoPos: 'autoPos'
+    swTone: 'autoTone'
   };
   for (const id in map) {
     const el = document.getElementById(id);
@@ -2565,7 +2638,7 @@ function syncUI() {
 
   setSeg('segPos', S.pos);
   setSeg('segScale', String(S.wmScale));
-  setSeg('segStill', S.still || 'auto');
+  renderStillSeg();                 // 档位按摄像头能力动态生成，再标选中项
   setSeg('segSize', String(S.size));
   setSeg('segView', S.view || 'wide');
   setSeg('segRot', String(S.videoRot || 'auto'));
@@ -2581,6 +2654,36 @@ function setSeg(id, val) {
   const box = document.getElementById(id);
   if (!box) return;
   $$('button', box).forEach(b => b.classList.toggle('on', b.dataset.v === String(val)));
+}
+
+/* 「图片尺寸」档位不写死：全是摄像头真正会给出的标准分辨率，
+   再按 getCapabilities 报的最大值过滤 —— 设备给不到的档位直接不列。 */
+function renderStillSeg() {
+  const box = $('#segStill');
+  if (!box) return;
+  const list = stillSteps();
+  // 换过设备 / 老版本存的值不在列表里：回 auto
+  if (S.still !== 'auto' && !list.some(s => s.id === String(S.still))) {
+    S.still = 'auto';
+    saveSettings();
+  }
+  const sig = list.map(s => s.id).join(',');
+  if (box.dataset.sig !== sig) {
+    const btn = (v, text, title) =>
+      '<button data-v="' + v + '"' + (title ? ' title="' + title + '"' : '') + '>' + text + '</button>';
+    const capLong = Math.max((caps.width && caps.width.max) || 0, (caps.height && caps.height.max) || 0);
+    let html = btn('auto', '自动', capLong
+      ? '最高 ' + Math.min(capLong, 4000) + 'px（横竖自动）'
+      : '设备能给多大就给多大');
+    for (const s of list) {
+      const long = Math.max(s.w, s.h);
+      const short = Math.min(s.w, s.h);
+      html += btn(s.id, s.name, s.w + '×' + s.h + '（横拍）/ ' + short + '×' + long + '（竖拍）');
+    }
+    box.innerHTML = html;
+    box.dataset.sig = sig;
+  }
+  setSeg('segStill', S.still);
 }
 
 function syncTools() {

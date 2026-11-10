@@ -959,6 +959,23 @@ body.land .bars{
 /* 非全屏时 .stage-col 还在文档流里，要给绝对定位的工具条一个参照系；
    全屏时它已经是 absolute inset:0，别覆盖 */
 body.land:not(.full) .stage-col{position:relative;gap:0}
+
+/* 横屏非全屏：取景框按 4:3 居中，左右必然空出黑边。黑边够宽时（JS 判定
+   左侧剩余 ≥150px 才挂 .side-bars）把工具条竖着搬进左边那块黑边 ——
+   它就不再压在画面上，界面也不用为它重排一遍。 */
+body.side-bars .bars{
+  position:absolute;z-index:6;
+  left:5px;right:auto;top:50%;
+  transform:translateY(-50%);
+  width:auto;max-width:168px;
+  flex-direction:column;align-items:flex-start;gap:6px;
+  padding:0;background:none;
+}
+body.side-bars .toolbar{
+  flex-direction:column;align-items:flex-start;gap:5px;
+  overflow:visible;max-width:100%;
+}
+body.side-bars .style-btn{padding:5px 9px;font-size:11px}
 /* 全屏：顶栏浮在最上面，工具条就往下让出它的高度（竖屏、横屏同理） */
 body.full .bars{
   position:absolute;z-index:6;

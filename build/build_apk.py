@@ -37,8 +37,8 @@ WWW = ROOT / "www"
 BUILD = ROOT / "build"
 
 APP_NAME = "此刻相机"
-DEFAULT_CODE = 17
-DEFAULT_NAME = "1.4.9"
+DEFAULT_CODE = 18
+DEFAULT_NAME = "1.5.0"
 
 # 本地签名材料（都已 gitignore）
 KEYSTORE = BUILD / "wmc.keystore"
@@ -174,19 +174,89 @@ def patch_manifest(data, version_code, version_name):
         return p, blen, bytes(buf[p:p + blen]).decode("utf-16-le", "replace")
 
     # ---- 覆盖 versionName ----
-    old_new = ("1.2.0".encode(enc), version_name.encode(enc))
-    if len(old_new[0]) != len(old_new[1]):
-        raise RuntimeError("versionName 必须与原值等长，才能原地改写")
+    # 版本号位数会变（1.4.9 → 1.4.10），等长时直接原地覆盖；变长/变短就把
+    # 整个字符串池重建一遍 —— 池里其它字符串按索引被 XML 节点引用，重建后
+    # 索引不变，只有池后面的字节整体位移，改一下根 chunk 的总长度即可。
+    old_bytes = "1.2.0".encode(enc)
+    new_bytes = version_name.encode(enc)
     hit = 0
-    for i in range(cnt):
-        p, n, _ = read(i)
-        if bytes(buf[p:p + n]) == old_new[0]:
-            buf[p:p + n] = old_new[1]
-            hit += 1
+    if len(old_bytes) == len(new_bytes):
+        for i in range(cnt):
+            p, n, _ = read(i)
+            if bytes(buf[p:p + n]) == old_bytes:
+                buf[p:p + n] = new_bytes
+                hit += 1
+    else:
+        psize = struct.unpack_from("<I", buf, pool_off + 4)[0]
+
+        def encode_str(text):
+            """按池的编码方式重新编码一条字符串（含长度前缀与结尾 0）"""
+            if utf8:
+                b = text.encode("utf-8")
+                if len(b) > 0x7F:
+                    head = bytes([((len(b) >> 8) | 0x80), len(b) & 0xFF])
+                else:
+                    head = bytes([len(b)])
+                # 第一个字节是 UTF-16 字符数，解析器只把它当提示，取 0 即可
+                return b"\x00" + head + b + b"\x00"
+            b = text.encode("utf-16-le")
+            nch = len(b) // 2
+            if nch > 0x7FFF:
+                head = struct.pack("<HH", ((nch >> 16) | 0x8000), nch & 0xFFFF)
+            else:
+                head = struct.pack("<H", nch)
+            return head + b + b"\x00\x00"
+
+        entries = []
+        for i in range(cnt):
+            p, n, s = read(i)
+            raw = bytes(buf[p:p + n])
+            if raw == old_bytes:
+                raw = new_bytes
+                hit += 1
+                entries.append(encode_str(version_name))
+            else:
+                entries.append(encode_str(s))
+
+        styles = b""
+        stystart = struct.unpack_from("<I", buf, pool_off + 24)[0]
+        if styc and stystart:
+            styles = bytes(buf[pool_off + stystart: pool_off + psize])
+
+        data = b"".join(entries)
+        offs = []
+        acc = 0
+        for e in entries:
+            offs.append(acc)
+            acc += len(e)
+        str_start = hsize + 4 * cnt + 4 * styc
+        total = str_start + len(data) + len(styles)
+
+        header = bytearray(buf[pool_off:pool_off + hsize])
+        struct.pack_into("<I", header, 4, total)          # 池 chunk 大小
+        struct.pack_into("<I", header, 20, str_start)     # stringsStart
+        # 没有 style 数据时 stylesStart 要写 0（与 aapt 生成的原始结构一致）
+        struct.pack_into("<I", header, 24, (str_start + len(data)) if styc else 0)
+        newpool = bytes(header) + b"".join(struct.pack("<I", o) for o in offs) + data + styles
+
+        delta = len(newpool) - psize
+        buf = bytearray(bytes(buf[:pool_off]) + newpool + bytes(buf[pool_off + psize:]))
+        # 根节点（RES_XML_TYPE）的总长度要跟着变
+        root_size = struct.unpack_from("<I", buf, 4)[0]
+        struct.pack_into("<I", buf, 4, root_size + delta)
+        # 池位置之后的 chunk 起点都平移了，重新定位
+        cnt2, styc2, flags2, sstart2, stystart2 = struct.unpack_from("<IIIII", buf, pool_off + 8)
+        base = pool_off + sstart2
+        offsets = offs
+        cnt = cnt2
+
     if hit:
-        print(f"  versionName → {version_name}")
+        print(f"  versionName → {version_name}" + ("" if len(old_bytes) == len(new_bytes) else "（重建字符串池）"))
+        if len(old_bytes) == len(new_bytes):
+            base = pool_off + struct.unpack_from("<I", buf, pool_off + 20)[0]
     else:
         print("  ! 未找到 old versionName，跳过（可能已改过）")
+        base = pool_off + struct.unpack_from("<I", buf, pool_off + 20)[0]
 
     # ---- 改写 versionCode ----
     name_idx = None
