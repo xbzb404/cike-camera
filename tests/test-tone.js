@@ -135,5 +135,35 @@ ok('参数越界被夹住', () => {
   assert.ok(/brightness\(0\.500\) contrast\(1\.500\)/.test(f), f);
 });
 
+console.log('\n[5] 百分位与高光保护');
+ok('百分位算得对（7% 纯白 → p995 = 1）', () => {
+  const st = Tone.analyze(img([{ rgb: WHITE, count: 70 }, { rgb: [143, 143, 143], count: 930 }]), 1);
+  assert.ok(st.p995 > 0.98, 'p995=' + st.p995);
+  assert.ok(Math.abs(st.p50 - 143 / 255) < 0.01, 'p50=' + st.p50);
+});
+ok('全灰 p50 ≈ 0.5', () => {
+  const st = Tone.analyze(img([{ rgb: GREY, count: 1000 }]), 1);
+  assert.ok(Math.abs(st.p50 - 128 / 255) < 0.01);
+});
+ok('轻微溢出但有饱和高光 → 高光保护压到 0.95', () => {
+  const st = Tone.analyze(img([{ rgb: WHITE, count: 70 }, { rgb: [143, 143, 143], count: 930 }]), 1);
+  assert.strictEqual(Tone.tierFor(st), 1);
+  assert.strictEqual(Tone.highlightGuard(st), 0.95);
+  assert.strictEqual(Tone.brightnessFor(st), 0.95);
+});
+ok('晴天 5% 高光不触发保护', () => {
+  const st = Tone.analyze(img([{ rgb: WHITE, count: 50 }, { rgb: [137, 137, 137], count: 950 }]), 1);
+  assert.strictEqual(Tone.highlightGuard(st), 1);
+  assert.strictEqual(Tone.brightnessFor(st), 1);
+});
+ok('提亮场景不被保护压回 1', () => {
+  const st = Tone.analyze(img([{ rgb: [30, 30, 30], count: 1000 }]), 1);
+  assert.strictEqual(Tone.brightnessFor(st), 1.08);
+});
+ok('保护有下限，不会压到 0.72 以下', () => {
+  const st = Tone.analyze(img([{ rgb: WHITE, count: 1000 }]), 1);
+  assert.ok(Tone.highlightGuard(st) >= 0.72 - 1e-9, String(Tone.highlightGuard(st)));
+});
+
 console.log('\n通过 ' + pass + ' / ' + (pass + fail));
 process.exit(fail ? 1 : 0);

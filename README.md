@@ -103,6 +103,8 @@ python build/build_apk.py --no-sign          # 只出未签名包
 node tests/test-exif.js        # EXIF 写入 → 读取 往返（11 项）
 node tests/test-layout.js      # 8 样式 × 3 尺寸 × 3 位置 × 3 字号 = 216 组排版（重叠/越界）
                                #  + 24 组缩放一致性（字号必须随画布宽度等比变化）
+node tests/test-tone.js        # 曝光/影调：溢出统计、百分位、档位建议、高光保护（26 项）
+node tests/test-imgproc.js     # 对焦评分、多帧择优、渐进降采样（15 项）
 PW_PATH=<playwright-core 路径> node tests/e2e-capture.js   # 假摄像头真实拍摄 + 验真页闭环（16 项）
 ```
 

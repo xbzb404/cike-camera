@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.3.2';
+const APP_VERSION = '1.3.3';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -727,6 +727,10 @@ function nextFrame() {
   });
 }
 
+function sleep(ms) {
+  return new Promise(res => setTimeout(res, ms));
+}
+
 function grabFrame() {
   const W = video.videoWidth, H = video.videoHeight;
   const c = document.createElement('canvas');
@@ -735,29 +739,24 @@ function grabFrame() {
   return c;
 }
 
-/* 清晰度评分：灰度拉普拉斯方差，越大越清晰 */
-function sharpness(canvas) {
-  const sw = 320, sh = Math.max(1, Math.round(320 * canvas.height / canvas.width));
+/* 画质评估：只取画面中央 62% 区域，按较高分辨率采样。
+   整帧缩到 320px 会把高频细节滤掉，帧间差异被压平，择优就成了抽签。 */
+function frameQuality(canvas) {
+  const sw = canvas.width, sh = canvas.height;
+  const rw = Math.round(sw * 0.62), rh = Math.round(sh * 0.62);
+  const sx = Math.round((sw - rw) / 2), sy = Math.round((sh - rh) / 2);
+  const TW = Math.min(640, Math.max(160, rw));
+  const th = Math.max(1, Math.round(TW * rh / rw));
+
   const c = document.createElement('canvas');
-  c.width = sw; c.height = sh;
+  c.width = TW; c.height = th;
   const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(canvas, 0, 0, sw, sh);
-  const d = ctx.getImageData(0, 0, sw, sh).data;
-  const g = new Float32Array(sw * sh);
-  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
-    g[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-  }
-  let sum = 0, sum2 = 0, n = 0;
-  for (let y = 1; y < sh - 1; y++) {
-    for (let x = 1; x < sw - 1; x++) {
-      const i = y * sw + x;
-      const v = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - sw] - g[i + sw];
-      sum += v; sum2 += v * v; n++;
-    }
-  }
-  if (!n) return 0;
-  const mean = sum / n;
-  return sum2 / n - mean * mean;
+  ctx.drawImage(canvas, sx, sy, rw, rh, 0, 0, TW, th);
+  const data = ctx.getImageData(0, 0, TW, th).data;
+
+  const f = window.WMImg ? WMImg.focusScore(data, TW, th) : { score: 0, texture: 0 };
+  const t = window.WMCTone ? WMCTone.analyze(data, 2) : null;
+  return { score: f.score, texture: f.texture, stats: t };
 }
 
 /**
@@ -784,19 +783,24 @@ async function grabBestImage() {
     }
   }
 
-  // ② 预览帧：一次取多帧，取最清晰的那张，抵消手抖与对焦抖动
+  // ② 预览帧：取多帧后择优。帧间要留出间隔，
+  //    紧挨着的两帧几乎一样，抓不到手抖和对焦拉风箱带来的差异。
   const n = S.smartPick ? 3 : 1;
-  const frames = [];
+  const cands = [];
   for (let i = 0; i < n; i++) {
     await nextFrame();
-    frames.push(grabFrame());
+    if (i) await sleep(80);
+    const f = grabFrame();
+    cands.push({ canvas: f, q: frameQuality(f) });
   }
-  let best = frames[0], bestScore = -1;
-  for (const f of frames) {
-    const sc = sharpness(f);
-    if (sc > bestScore) { bestScore = sc; best = f; }
-  }
-  return { src: best, w: best.width, h: best.height, via: 'video', score: bestScore, stats: statsOf(best) };
+  const idx = Math.max(0, WMImg.selectBest(cands.map(c => ({
+    score: c.q.score, blown: c.q.stats ? c.q.stats.blown : 0
+  }))));
+  const pick = cands[idx];
+  return {
+    src: pick.canvas, w: pick.canvas.width, h: pick.canvas.height,
+    via: 'video', score: pick.q.score, stats: pick.q.stats, cands: cands.length
+  };
 }
 
 /* cover 裁剪：让源图按目标比例居中裁切 */
@@ -845,10 +849,25 @@ function composeCanvas(raw) {
     ctx.translate(outW, 0);
     ctx.scale(-1, 1);
   }
+  // 大比例缩小（≥2 倍）时先逐级减半再落到目标尺寸，
+  // 一次到位会让双线性采样跳过大片像素，出现锯齿和糊边
+  let srcEl = raw.src, sX = zx, sY = zy, sW = zw, sH = zh;
+  if (window.WMImg) {
+    for (const st of WMImg.downscalePlan(zw, zh, outW)) {
+      const t = document.createElement('canvas');
+      t.width = st.w;
+      t.height = st.h;
+      const tc = t.getContext('2d');
+      tc.imageSmoothingQuality = 'high';
+      tc.drawImage(srcEl, sX, sY, sW, sH, 0, 0, st.w, st.h);
+      srcEl = t; sX = 0; sY = 0; sW = st.w; sH = st.h;
+    }
+  }
+
   // 影调修正：与取景器上所见的亮度保持一致（CSS filter 不会影响 drawImage，这里要显式再来一次）
   const tf = toneFilter();
   if (tf !== 'none') ctx.filter = tf;
-  ctx.drawImage(raw.src, zx, zy, zw, zh, 0, 0, outW, outH);
+  ctx.drawImage(srcEl, sX, sY, sW, sH, 0, 0, outW, outH);
   ctx.filter = 'none';
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   return canvas;
