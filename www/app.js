@@ -545,7 +545,7 @@ function renderOverlay() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
 
-  const d = WM.buildData(liveBase(), S, uiCode);
+  const d = WM.buildData(displayBase(liveBase()), S, uiCode);
   // 取景器里底图就是视频，亮度直接从 video 采样
   let ink = 'dark';
   if (S.autoInk) {
@@ -631,12 +631,23 @@ function wgs84ToGcj02(lat, lng) {
   return [lat + dLat, lng + dLng];
 }
 
-/* 打出水印时用的坐标（按设置转 GCJ-02） */
-function displayCoords() {
-  if (geo.lat == null) return { lat: null, lng: null };
-  if (!S.coordGcj) return { lat: geo.lat, lng: geo.lng };
-  const g = wgs84ToGcj02(geo.lat, geo.lng);
-  return { lat: g[0], lng: g[1] };
+/**
+ * 画面上的坐标可以按设置换成 GCJ-02（和国内地图 App 读数一致），
+ * 但签名里必须永远是原始 WGS-84，否则验签信息与实际定位不符。
+ */
+function displayBase(base) {
+  if (!S.coordGcj || base.lat == null) return base;
+  const g = wgs84ToGcj02(base.lat, base.lng);
+  return Object.assign({}, base, { lat: g[0], lng: g[1], gcj: true });
+}
+
+/* 干净拷贝：保留原图用于「改水印」重出图，避免在带水印的图上反复叠加 */
+function cloneCanvas(src) {
+  const c = document.createElement('canvas');
+  c.width = src.width;
+  c.height = src.height;
+  c.getContext('2d').drawImage(src, 0, 0);
+  return c;
 }
 
 /* ============================================================
@@ -802,7 +813,7 @@ async function renderPhoto(canvas, base, override) {
     try { ink = WM.measureInk(ctx, canvas.width, canvas.height, st.pos === 'top' ? 'top' : 'bottom'); } catch (e) {}
   }
 
-  const d = WM.buildData(base, st, code);
+  const d = WM.buildData(displayBase(base), st, code);
   WM.draw(ctx, canvas.width, canvas.height, d, {
     style: st.style, pos: st.pos, scale: st.wmScale, ink, s: st
   });
@@ -912,14 +923,8 @@ async function capture() {
     const raw = await grabBestImage();
     const base = liveBase();
 
-    // 坐标按设置转换
-    if (S.coordGcj && base.lat != null) {
-      const g = wgs84ToGcj02(base.lat, base.lng);
-      base.latGcj = g[0]; base.lngGcj = g[1];
-    }
-
     const canvas = composeCanvas(raw);
-    lastRaw = canvas;
+    lastRaw = cloneCanvas(canvas);   // 干净底图，留给「改水印」
     lastBase = base;
 
     showBusy('正在签名…');
@@ -1054,7 +1059,7 @@ async function reRender() {
   busy = true;
   showBusy('正在重新出图…');
   try {
-    const r = await renderPhoto(lastRaw, lastBase);
+    const r = await renderPhoto(cloneCanvas(lastRaw), lastBase);
     shotBlob = r.blob;
     shotCode = r.code;
     openPreview(r.blob, r.code);
@@ -1278,7 +1283,7 @@ async function importFile(file) {
 
     showBusy('正在签名…');
     const base = { time, lat, lng, addr, weather: geo.weather || '', src, acc: null, altitude: null };
-    lastRaw = canvas;
+    lastRaw = cloneCanvas(canvas);
     lastBase = base;
     const r = await renderPhoto(canvas, base);
     shotBlob = r.blob;
@@ -1366,7 +1371,7 @@ function paintStyleThumbs() {
   if (!grid) return;
   const sz = sizeStyleThumbs() || { w: 340, h: 340 };
   const base = snapshotFrame(sz.w, sz.h);
-  const d = WM.buildData(liveBase(), S, uiCode);
+  const d = WM.buildData(displayBase(liveBase()), S, uiCode);
   let ink = 'dark';
   if (S.autoInk) {
     try { ink = WM.measureInk(base.getContext('2d'), sz.w, sz.h, S.pos === 'top' ? 'top' : 'bottom'); } catch (e) {}

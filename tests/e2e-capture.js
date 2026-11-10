@@ -129,6 +129,39 @@ const LNG = 121.473701;
 
   ok('运行期无 JS 错误', errors.length === 0, errors.slice(0, 3).join(' | '));
 
+  /* ---------- 改水印：不能重复叠加 ---------- */
+  const clean = await page.evaluate(() => {
+    const c = document.createElement('canvas');
+    c.width = lastRaw.width;
+    c.height = lastRaw.height;
+    const cx = c.getContext('2d');
+    cx.drawImage(lastRaw, 0, 0);
+    const x0 = 0, y0 = Math.floor(c.height * 0.72);
+    const w = Math.floor(c.width * 0.55), h = c.height - y0;
+    const d = cx.getImageData(x0, y0, w, h).data;
+    let white = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i] > 225 && d[i + 1] > 225 && d[i + 2] > 225) white++;
+    }
+    return { ratio: white / (d.length / 4), w: c.width, h: c.height };
+  });
+  ok('保留的底图是「无水印」干净图', clean.ratio < 0.005, '白像素占比 ' + (clean.ratio * 100).toFixed(2) + '%');
+
+  // 固定成静态水印（时间和验真码会随时间变），再连续重出两次对比哈希
+  const hashes = await page.evaluate(async () => {
+    Object.assign(S, {
+      showTime: false, showCode: false, showPlace: false,
+      showCoords: false, showWeather: false
+    });
+    const imh = async () => {
+      await reRender();
+      const b = new Uint8Array(await shotBlob.arrayBuffer());
+      return WMC.base32(await WMC.sha256(WMC.jpeg.strip(b)), 26);
+    };
+    return [await imh(), await imh()];
+  });
+  ok('连续两次「改水印」结果一致（未叠加）', hashes[0] === hashes[1], hashes.join(' / '));
+
   /* ---------- 验真页闭环 ---------- */
   const vp = await ctx.newPage();
   const vErr = [];

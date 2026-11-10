@@ -1,8 +1,7 @@
-# 构建产物
-build/*.apk
-build/*.idsig
-build/out/
-build/tmp/
+# 构建产物（只保留脚本本身）
+build/*
+!build/build_apk.py
+!build/SignApk.java
 
 # 签名材料（绝不入库）
 *.keystore

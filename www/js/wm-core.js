@@ -154,7 +154,9 @@
       timeHM: hm + sec,
       weekday: '周' + week,
       location: base.addr || '',
-      coords: fmtCoords(base.lat, base.lng, s),
+      coords: (base.lat != null && base.lng != null)
+        ? fmtCoords(base.lat, base.lng, s) + (base.gcj ? ' GCJ-02' : '')
+        : '',
       altitude: (base.altitude != null && s.showAltitude) ? `海拔 ${Math.round(base.altitude)} 米` : '',
       accuracy: (base.acc != null && s.showAccuracy) ? `精度 ±${Math.round(base.acc)} 米` : '',
       weather: base.weather || '',
