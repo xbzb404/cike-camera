@@ -104,6 +104,38 @@ body.orient-lock #btnOrient{color:var(--accent);border-color:rgba(255,210,74,.45
   background:#000;
   display:block;
 }
+/* 视野选「完整」时不裁切，保留全部场景，代价是可能留黑边 */
+.stage.view-wide video{object-fit:contain}
+
+/* ---------- 停流占位 ----------
+   <video> 的 srcObject 一旦置空（切后台、换镜头、改尺寸都会），
+   Android WebView 会立刻把它画成自带的默认媒体占位图：一块灰底 + 一个
+   巨大的播放箭头。用户切屏回来看到的就是这张「丑图」。
+   停流前把最后一帧抓成静态图盖住，并把 video 藏起来，视觉上就是画面暂停。 */
+.stage .poster{
+  position:absolute;left:0;top:0;
+  width:100%;height:100%;
+  object-fit:cover;
+  display:none;
+  z-index:1;
+}
+.stage.view-wide .poster{object-fit:contain}
+.stage.nolive video{visibility:hidden}
+.stage.nolive .poster{display:block}
+
+/* 双保险：即便某个机型既没抓到帧、也没被 nolive 覆盖，
+   也不允许 WebView 画出默认控件层 */
+.stage video::-webkit-media-controls,
+.stage video::-webkit-media-controls-enclosure,
+.stage video::-webkit-media-controls-panel,
+.stage video::-webkit-media-controls-play-button,
+.stage video::-webkit-media-controls-start-playback-button{
+  display:none!important;
+  -webkit-appearance:none!important;
+  opacity:0!important;
+  pointer-events:none!important;
+  width:0!important;height:0!important;
+}
 .stage video.mirrored{transform:scaleX(-1)}
 #overlay{
   position:absolute;

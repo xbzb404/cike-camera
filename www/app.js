@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.4.2';
+const APP_VERSION = '1.4.3';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -37,6 +37,7 @@ const DEFAULTS = {
   pos: 'bl',            // bl | br | tl | tr（左下/右下/左上/右上）
   autoPos: true,        // 横屏时自动把水印挪到空着的角落
   size: '1080',         // 预览流长边：720 | 1080 | 1440
+  view: 'fill',         // fill 填满取景框 | wide 完整视角（不裁，可能留黑边）
   wmScale: 1,           // 0.85 | 1 | 1.15
   autoInk: true,        // 按底图亮度自动切深/浅墨水
   fields: [],           // 自定义字段 [{k,v}]
@@ -159,6 +160,59 @@ function hideGuard() {
 function showBusy(t) { showGuard(t || '处理中…', '请稍候'); }
 function hideBusy() { hideGuard(); }
 
+/* ---------- 停流占位 ----------
+   srcObject 一置空，WebView 就把 <video> 画成自带的「灰底 + 巨大播放箭头」。
+   切后台、换镜头、改预览尺寸都会走到这里，于是用户切回来就看见那张丑图。
+   办法：停流**之前**抓一帧存成 <img>，盖在上面；video 隐藏。 */
+function setLive(on) {
+  if (!stage) return;
+  stage.classList.toggle('nolive', !on);
+}
+
+function grabPoster() {
+  const p = $('#poster');
+  if (!p) return;
+  const W = stage.clientWidth, H = stage.clientHeight;
+  if (!W || !H) return;
+  if (!video.videoWidth || !video.videoHeight) return;
+  // 手动指定过画面旋转的机型，这里的坐标换算容易出错，直接放弃抓帧，
+  // 退回纯黑底（总比 WebView 的播放按钮好看）
+  if (videoRotDeg()) return;
+
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const k = Math.min(1, 600 / Math.max(W, H));
+  const cw = Math.max(2, Math.round(W * k));
+  const ch = Math.max(2, Math.round(H * k));
+  const c = document.createElement('canvas');
+  c.width = cw; c.height = ch;
+  const ctx = c.getContext('2d');
+  if (!ctx) return;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, cw, ch);
+
+  // 与 CSS 的 object-fit 保持一致：fill=cover 裁边，wide=contain 留黑边
+  const cover = S.view !== 'wide';
+  const s = cover
+    ? Math.max(cw / vw, ch / vh)
+    : Math.min(cw / vw, ch / vh);
+  const dw = vw * s, dh = vh * s;
+  ctx.save();
+  ctx.translate(cw / 2, ch / 2);
+  if (facing === 'user') ctx.scale(-1, 1);
+  try { ctx.drawImage(video, -dw / 2, -dh / 2, dw, dh); } catch (e) { ctx.restore(); return; }
+  ctx.restore();
+
+  // 水印是画在 overlay 上的独立图层，不一起烤进去的话，
+  // 切后台那一刻水印会「消失」，看起来像画面断了一截。
+  const ov = $('#overlay');
+  if (ov && ov.width) {
+    try { ctx.drawImage(ov, 0, 0, cw, ch); } catch (e) {}
+  }
+
+  // 切后台时同步执行，0.78 的质量在 600px 上大约 40~60KB，代价可接受
+  try { p.src = c.toDataURL('image/jpeg', 0.78); } catch (e) {}
+}
+
 function stopStream() {
   stopToneLoop();
   if (stream) {
@@ -196,10 +250,15 @@ function streamConstraint() {
   // 长边取用户所选，短边按 3:4 折算（与手机竖握时传感器的裁切比例一致）
   const w = land ? longEdge : Math.round(longEdge * 3 / 4);
   const h = land ? Math.round(longEdge * 3 / 4) : longEdge;
+  // 注意：这里**故意不给 aspectRatio**。
+  // 之前写了 aspectRatio: { ideal: w/h }，浏览器为了让流满足这个比例，
+  // 会把传感器给的 16:9 / 4:3 全幅做**中心裁切**再交出来 —— 这等于平白
+  // 加了一个 1.5~1.8 倍的数码变焦，用户看到的就是「视角被拉近」。
+  // 只报尺寸，让 WebView 返回最接近的原生档位（一般是 1440×1080），
+  // 裁不裁、怎么裁由前端 CSS 决定，摄像头这边保持全幅。
   return {
     width: { ideal: w },
     height: { ideal: h },
-    aspectRatio: { ideal: w / h },
     frameRate: { ideal: 30 }
   };
 }
@@ -222,6 +281,9 @@ async function startCamera(deviceId, opts) {
     return false;
   }
 
+  // 先把上一帧留下来遮住 video，再停流 —— 顺序反了就会闪一下播放按钮
+  grabPoster();
+  setLive(false);
   stopStream();
   try {
     const video0 = Object.assign({}, streamConstraint());
@@ -249,11 +311,21 @@ async function startCamera(deviceId, opts) {
     zoom = { type: 'none', v: 1 };
     video.srcObject = stream;
     await video.play().catch(() => {});
+    // 等首帧真正上屏再撤占位图，否则会黑闪一下
+    await new Promise(res => {
+      if (video.readyState >= 2) return res();
+      let done = false;
+      const fin = () => { if (done) return; done = true; res(); };
+      try { video.addEventListener('loadeddata', fin, { once: true }); } catch (e) {}
+      setTimeout(fin, 700);
+    });
+    setLive(true);
     applyVideoTransform();
     layoutStage();
     startToneLoop();
     applyEv(S.ev);
 
+    await setupFocus(track);
     await setupZoom(track);
 
     updateToolCaps();
@@ -464,6 +536,40 @@ stage.addEventListener('click', e => {
 });
 
 let focusLocked = false;
+
+/* ---------- 自动对焦 ----------
+   之前只有点画面才触发一次对焦，其余时间完全靠摄像头的默认行为。
+   不少 Android WebView 默认给的是固定焦点或微距，远景一直糊，
+   用户感受就是「这个相机不会对焦」。
+   这里按能力协商：支持连续对焦就开连续；只支持单次/自动就每 3 秒补一脚。 */
+let autoFocusTimer = 0;
+
+async function setupFocus(track) {
+  if (autoFocusTimer) { clearInterval(autoFocusTimer); autoFocusTimer = 0; }
+  if (!track || !track.applyConstraints) return;
+  const modes = (track.getCapabilities && track.getCapabilities().focusMode) ||
+    (caps && caps.focusMode) || [];
+  if (!modes.length) return;
+
+  if (modes.includes('continuous')) {
+    try {
+      await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+      // 有些机型会「接受」约束但不执行，读回来对不上就不认
+      const got = track.getSettings && track.getSettings().focusMode;
+      if (got === 'continuous') return;
+    } catch (e) {}
+  }
+
+  const one = modes.includes('single-shot') ? 'single-shot'
+    : (modes.includes('auto') ? 'auto' : null);
+  if (!one) return;
+  const kick = () => {
+    if (document.hidden || !trackRef || trackRef !== track) return;
+    track.applyConstraints({ advanced: [{ focusMode: one }] }).catch(() => {});
+  };
+  kick();
+  autoFocusTimer = setInterval(kick, 3000);
+}
 
 async function focusAt(x, y, px, py) {
   const ring = $('#focusRing');
@@ -687,6 +793,8 @@ function layoutStage() {
   // 画面方向校正需要知道取景框的实际尺寸（旋转后宽高对调）
   stage.style.setProperty('--vsw', W + 'px');
   stage.style.setProperty('--vsh', H + 'px');
+  // 视野：wide 时 video 用 contain（不裁两侧，可能留黑边）
+  stage.classList.toggle('view-wide', S.view === 'wide');
   applyVideoTransform();
   renderOverlay();
 }
@@ -1157,7 +1265,12 @@ function composeCanvas(raw) {
     raw = Object.assign({}, raw, { src: r.src, w: r.w, h: r.h });
   }
   const vw = stage.clientWidth, vh = stage.clientHeight;
-  const targetR = (vw && vh) ? vw / vh : raw.w / raw.h;
+  // 视野「完整」时成片不再按取景框裁：整幅画面都留下，
+  // 否则预览里看到的两侧场景拍下来又没了，等于白给。
+  // 这时照片比例会跟着摄像头走（可能不是 3:4），是有意的。
+  const targetR = (S.view === 'wide' && raw.w && raw.h)
+    ? raw.w / raw.h
+    : ((vw && vh) ? vw / vh : raw.w / raw.h);
 
   const rect = coverRect(raw.w, raw.h, targetR);
   const z = (zoom.type === 'crop' && zoom.v > 1) ? zoom.v : 1;
@@ -1913,6 +2026,7 @@ function syncUI() {
   setSeg('segScale', String(S.wmScale));
   setSeg('segQuality', S.quality);
   setSeg('segSize', String(S.size));
+  setSeg('segView', S.view || 'fill');
   setSeg('segRot', String(S.videoRot || 'auto'));
   setSeg('segCoord', S.coordFmt);
 
@@ -2057,6 +2171,7 @@ function bindUI() {
     ['segScale', v => { S.wmScale = Number(v); }],
     ['segQuality', v => { S.quality = v; }],
     ['segSize', v => { S.size = v; }],
+    ['segView', v => { S.view = v; }],
     ['segCoord', v => { S.coordFmt = v; }],
     ['segRot', v => { S.videoRot = v; }]
   ];
@@ -2069,7 +2184,7 @@ function bindUI() {
       apply(b.dataset.v);
       saveSettings();
       syncUI();
-      if (id === 'segRot') { layoutStage(); renderOverlay(); }
+      if (id === 'segRot' || id === 'segView') { layoutStage(); renderOverlay(); }
       else renderOverlay();
       if (id === 'segQuality' || id === 'segSize') startCamera(curDeviceId, { keepLenses: true });
     });
@@ -2234,8 +2349,11 @@ function boot() {
 let resuming = false;
 
 function camSleep() {
+  if (autoFocusTimer) { clearInterval(autoFocusTimer); autoFocusTimer = 0; }
+  // 必须在 stopStream 之前抓帧：之后 video 已经没有画面可抓了
+  grabPoster();
+  setLive(false);
   stopStream();
-  try { video.srcObject = null; } catch (e) {}
 }
 
 async function camWake() {

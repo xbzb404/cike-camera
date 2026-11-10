@@ -55,6 +55,8 @@
    <div class="stage-col">
     <div class="stage" id="stage">
       <video id="video" playsinline autoplay muted></video>
+      <!-- 停流前抓的最后一帧：盖住 WebView 给 <video> 画的默认播放按钮占位图 -->
+      <img class="poster" id="poster" alt="" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
       <canvas id="overlay"></canvas>
 <div class="level-wrap" id="levelWrap" hidden>
         <div class="level-track"><div class="level-line" id="levelLine"></div><i class="level-notch"></i></div>
@@ -211,6 +213,13 @@
         <button data-v="720">720P</button>
         <button data-v="1080">1080P</button>
         <button data-v="1440">1440P</button>
+      </div>
+    </div>
+    <div class="field">
+      <span class="field-label">视野（画面被「拉近」就选完整，两侧场景全保留；完整时照片比例跟随摄像头）</span>
+      <div class="seg" id="segView">
+        <button data-v="fill">填满</button>
+        <button data-v="wide">完整</button>
       </div>
     </div>
     <div class="field">
