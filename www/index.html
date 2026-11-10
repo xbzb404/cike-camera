@@ -40,6 +40,12 @@
       <span class="brand-title">此刻相机</span>
       <span class="brand-sub" id="geoStatus">定位中…</span>
     </div>
+    <button class="icon-btn" id="btnOrient" aria-label="屏幕方向" title="方向：自动">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <g class="ico-auto"><path d="M20.5 12a8.5 8.5 0 1 1-2.9-6.4"></path><path d="M20.5 4v4.6h-4.6"></path><rect x="9.6" y="6.6" width="4.8" height="10.8" rx="1.2"></rect></g>
+        <g class="ico-lock"><rect x="5" y="10.5" width="14" height="9.5" rx="2.2"></rect><path d="M8.4 10.5V8a3.6 3.6 0 0 1 7.2 0v2.5"></path></g>
+      </svg>
+    </button>
     <button class="icon-btn" id="btnSwitch" aria-label="切换摄像头">
       <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v4"></path><path d="M9 21H5a2 2 0 0 1-2-2v-4"></path><path d="M21 9 14 2"></path><path d="M3 15l7 7"></path><path d="M14 2v5a2 2 0 0 0 2 2h5"></path><path d="M10 22v-5a2 2 0 0 0-2-2H3"></path></svg>
     </button>
@@ -205,6 +211,14 @@
         <button data-v="720">720P</button>
         <button data-v="1080">1080P</button>
         <button data-v="1440">1440P</button>
+      </div>
+    </div>
+    <div class="field">
+      <span class="field-label">画面方向（默认交给系统。画面躺倒 90° 时才手动指定）</span>
+      <div class="seg" id="segRot">
+        <button data-v="auto">自动</button>
+        <button data-v="90">顺时针 90°</button>
+        <button data-v="270">逆时针 90°</button>
       </div>
     </div>
     <div class="field">

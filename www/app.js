@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.4.1';
+const APP_VERSION = '1.5.0';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -56,8 +56,9 @@ const DEFAULTS = {
   jpegQuality: 0.94,
   level: false,         // 水平仪（默认关，需要时点开）
   ev: 0,                // 硬件曝光补偿（不是所有机型都支持）
-  autoTone: true,       // 自动压高光：成片发白时按亮度分析降一档
-  bright: 0             // 手动亮度补偿，-30 ~ +30（百分比）
+  autoTone: true,       // 自动影调：过曝归位 + 黑场白场归位
+  bright: 0,            // 手动亮度补偿，-30 ~ +30（百分比）
+  videoRot: 'auto'      // 画面方向：auto | 0 | 90 | 270
 };
 
 function readSettings() {
@@ -88,6 +89,14 @@ function readSettings() {
   if (!['720', '1080', '1440'].includes(String(s.size))) s.size = '1080';
   // 老用户的设置里没有这个字段，必须显式补 true，否则 Object.assign 之后是 undefined
   if (typeof s.autoPos !== 'boolean') s.autoPos = true;
+  // EV 一律不继承历史值。
+  // ------------------------------------------------------------
+  // 这个字段是「硬件曝光补偿」，滑到 +2 就是实打实多曝两档，画面必白。
+  // 之前它被持久化，用户为了「亮一点」拉过一次之后，每次启动都带着 +2，
+  // 于是「怎么拍都发白」—— 这是反馈里最冤的一个坑。
+  // 曝光补偿属于「当下场景的临时判断」，不该跨会话记忆。
+  s.ev = 0;
+  if (!['auto', '0', '90', '270'].includes(String(s.videoRot))) s.videoRot = 'auto';
   return s;
 }
 
@@ -168,7 +177,6 @@ function stopStream() {
 async function restartCamera() {
   stopStream();
   await sleep(80);
-  lastLand = isLandscape();
   let ok = false;
   if (curDeviceId) ok = await startCamera(curDeviceId);
   if (!ok) ok = await startCamera(null);
@@ -265,9 +273,37 @@ async function startCamera(deviceId, opts) {
   }
 }
 
-/* 预览层变换：镜像 + 裁切变焦 */
+/* 预览层变换：镜像 + 裁切变焦 + 画面方向校正 */
+function videoRotDeg() {
+  if (S.videoRot && S.videoRot !== 'auto') {
+    const n = Number(S.videoRot);
+    return (n === 90 || n === 270) ? n : 0;
+  }
+  // 自动 = 信任 WebView 的 display rotation（Android 上它会把 sensor 帧转到
+  // 屏幕方向再交给 <video>），这里不再二次旋转。
+  // 少数机型不做旋转，画面会躺 90°，用设置里的「画面方向」手动扳正即可。
+  return 0;
+}
+
 function applyVideoTransform() {
+  const rot = videoRotDeg();
   const parts = [];
+  if (rot) {
+    // 旋转后宽高要对调，否则画面会被拉成长条。--vsw/--vsh 由 layoutStage 写入。
+    video.style.position = 'absolute';
+    video.style.left = '50%';
+    video.style.top = '50%';
+    video.style.width = 'var(--vsh, 100%)';
+    video.style.height = 'var(--vsw, 100%)';
+    parts.push('translate(-50%,-50%)');
+    parts.push('rotate(' + rot + 'deg)');
+  } else {
+    video.style.position = '';
+    video.style.left = '';
+    video.style.top = '';
+    video.style.width = '';
+    video.style.height = '';
+  }
   if (facing === 'user') parts.push('scaleX(-1)');
   if (zoom.type === 'crop' && zoom.v > 1) parts.push('scale(' + zoom.v + ')');
   video.style.transformOrigin = '50% 50%';
@@ -486,9 +522,137 @@ function updateToolCaps() {
 /* ============================================================
    取景排版 / 实时水印
    ============================================================ */
-/* 横屏判定：短边小于 620 视为手机横放（平板横屏仍按竖排走，空间够） */
+/* 方向状态。
+   ------------------------------------------------------------
+   壳把 Activity 钉死在竖屏（manifest screenOrientation=1），所以系统
+   永远不会替我们转窗口，window.innerWidth 也永远是竖的 —— 这就是
+   「手机横过来界面不动」的真正原因，光靠 CSS 媒体查询救不回来。
+
+   这里改成陀螺仪驱动：读 deviceorientation 的 beta/gamma 算出重力在
+   机身坐标系里的方向，判断手机是竖放、左横、右横还是倒置，再把整个
+   #app 用 CSS 转 90° —— 相当于自己实现了一次屏幕旋转，好处是
+   可以随时「锁住当前方向」。 */
+const orient = {
+  auto: true,       // 是否跟随陀螺仪
+  q: 0,             // 0 竖 / 90 左横 / -90 右横 / 180 倒置
+  lockedQ: 0,       // 锁定时的方向
+  cand: 0, candN: 0,// 候选方向与连续命中次数（防抖）
+  hasSensor: false
+};
+
 function isLandscape() {
+  if (orient.q === 90 || orient.q === -90) return true;
+  // 没有陀螺仪权限时退回视口比例判断
+  if (orient.hasSensor) return false;
   return window.innerWidth > window.innerHeight && window.innerHeight < 620;
+}
+
+let lastLandQ = null;
+let orientReopenTimer = 0;
+
+function applyOrientation() {
+  const q = orient.auto ? orient.q : orient.lockedQ;
+  const body = document.body;
+  const land = q === 90 || q === -90;
+  // 只有「视口还是竖的、但设备已经横过来」时才需要自己转 90°。
+  // 真正横屏视口（平板、桌面窗口）本来就横着，再加旋转就转回去了。
+  const needRotate = land && window.innerHeight > window.innerWidth;
+  body.classList.toggle('q90', needRotate && q === 90);
+  body.classList.toggle('q270', needRotate && q === -90);
+  body.classList.toggle('land', land);
+  // 旋转会改变可用宽高，等一帧再排
+  requestAnimationFrame(() => {
+    layoutStage();
+    renderOverlay();
+    paintStyleThumbs();
+  });
+
+  // 横竖切换后要按新方向重新协商一路流：竖屏拿着 3:4 的流去横屏取景，
+  // 画面只占中间一条（横向视野拿不到，拍出来也是竖构图）。延迟一点再切，
+  // 避免手抖来回转时反复开关摄像头。
+  const landChanged = lastLandQ !== null && lastLandQ !== land;
+  lastLandQ = land;
+  if (!landChanged) return;
+  clearTimeout(orientReopenTimer);
+  orientReopenTimer = setTimeout(() => {
+    if (camStarting || resuming || busy) return;
+    if (!video.srcObject) return;
+    startCamera(curDeviceId, { keepLenses: true });
+  }, 480);
+}
+
+/* 重力单位向量（W3C DeviceOrientation 规范）。
+   竖立正对用户 → beta≈90，gy≈-1；顶部朝左横放 → gamma≈-90，gx≈+1。 */
+function gravityOf(beta, gamma) {
+  const b = (beta || 0) * Math.PI / 180;
+  const g = (gamma || 0) * Math.PI / 180;
+  return {
+    gx: -Math.cos(b) * Math.sin(g),
+    gy: -Math.sin(b),
+    gz: Math.cos(b) * Math.cos(g)
+  };
+}
+
+function angleFromGravity(gx, gy) {
+  if (Math.abs(gy) >= Math.abs(gx)) {
+    return gy < 0 ? 0 : 180;        // 正立 / 倒置
+  }
+  // 重力指向 +x（右侧朝下）→ 手机向左横（顶部朝右）→ 内容顺时针转回来
+  return gx > 0 ? 90 : -90;
+}
+
+let orientBound = false;
+function initOrientation() {
+  if (orientBound) return;
+  orientBound = true;
+
+  const onOrient = (e) => {
+    if (e.beta == null && e.gamma == null) return;
+    orient.hasSensor = true;
+    if (!orient.auto) return;
+    const { gx, gy } = gravityOf(e.beta, e.gamma);
+    const q = angleFromGravity(gx, gy);
+    // 防抖：连续 3 次（约 150ms）同一方向才真的转，避免手抖来回跳
+    if (q === orient.cand) orient.candN++;
+    else { orient.cand = q; orient.candN = 1; }
+    if (orient.candN < 3) return;
+    if (q === orient.q) return;
+    orient.q = q;
+    applyOrientation();
+  };
+
+  window.addEventListener('deviceorientation', onOrient, true);
+  // 没有陀螺仪事件时（桌面浏览器、或权限被拒），退回看视口比例
+  window.addEventListener('resize', () => {
+    if (orient.hasSensor) return;
+    const q = window.innerWidth > window.innerHeight ? 90 : 0;
+    if (q !== orient.q) { orient.q = q; applyOrientation(); }
+  });
+}
+
+/* 授权：iOS 13+ 需要用户手势里显式申请；Android WebView 直接可用。 */
+async function requestOrientPermission() {
+  const D = window.DeviceOrientationEvent;
+  if (D && typeof D.requestPermission === 'function') {
+    try {
+      const r = await D.requestPermission();
+      return r === 'granted';
+    } catch (e) { return false; }
+  }
+  return true;
+}
+
+function setOrientAuto(on) {
+  orient.auto = on;
+  if (!on) {
+    orient.lockedQ = orient.q;
+    toast('已锁定：' + (isLandscape() ? '横屏' : '竖屏') + '（手机转动不再跟随）');
+  } else {
+    toast('已恢复自动旋转');
+  }
+  document.body.classList.toggle('orient-lock', !on);
+  applyOrientation();
+  syncTools();
 }
 
 function layoutStage() {
@@ -501,15 +665,29 @@ function layoutStage() {
   if (bar && !land) availH -= bar.offsetHeight + 10;
   if (availW <= 0 || availH <= 0) return;
 
-  const vw = video.videoWidth || 1080;
-  const vh = video.videoHeight || 1440;
-  const ratio = vw / vh;
+  // 取景框不再「按视频流比例算」—— 那是它变小的元凶。
+  // 摄像头给的流可能是 16:9 横（Android WebView 常见），竖着拿时按这个
+  // 比例排，画面上就只剩一条矮横带。
+  //   竖屏：固定 3:4，画面用 cover 填满，取景框占满可用区域；
+  //   横屏：直接铺满整块（顶栏/工具条/快门都是浮层，不再抢高度）。
+  let w, h;
+  if (land) {
+    w = availW;
+    h = availH;
+  } else {
+    const targetR = 3 / 4;
+    w = availW;
+    h = w / targetR;
+    if (h > availH) { h = availH; w = h * targetR; }
+  }
 
-  let w = availW;
-  let h = w / ratio;
-  if (h > availH) { h = availH; w = h * ratio; }
-  stage.style.width = Math.round(w) + 'px';
-  stage.style.height = Math.round(h) + 'px';
+  const W = Math.round(w), H = Math.round(h);
+  if (stage.style.width !== W + 'px') stage.style.width = W + 'px';
+  if (stage.style.height !== H + 'px') stage.style.height = H + 'px';
+  // 画面方向校正需要知道取景框的实际尺寸（旋转后宽高对调）
+  stage.style.setProperty('--vsw', W + 'px');
+  stage.style.setProperty('--vsh', H + 'px');
+  applyVideoTransform();
   renderOverlay();
 }
 
@@ -551,7 +729,16 @@ function renderOverlay() {
   if (S.autoInk) {
     try { ink = sampleVideoInk(pos); } catch (e) { ink = 'dark'; }
   }
+  // 横屏是全屏取景，顶栏和快门都是浮层压在画面上。
+  // 水印贴角会正好被它们盖住，所以整体让开一段：贴顶的往下让顶栏，
+  // 贴底的往上让快门条。竖屏不受影响（工具条在画面之外）。
+  ctx.save();
+  if (isLandscape()) {
+    const shift = isTopPos(pos) ? 42 : -78;
+    ctx.translate(0, shift);
+  }
   WM.draw(ctx, W, H, d, { style: S.style, pos, scale: S.wmScale, ink, s: S });
+  ctx.restore();
 }
 
 let inkCanvas = null;
@@ -625,11 +812,15 @@ function toneActive() {
    这里原先是无条件给 video 挂 CSS filter。对一个 1920×2560 的视频层
    每帧都跑一遍 GPU 滤镜通道，代价极高 —— 这是「刷新率极低」的第二大来源
    （第一是预览流本身分辨率太高）。
-   只有用户手动拉过亮度滑块时才挂滤镜（那时确实需要所见即所得），
-   自动影调只作用于成片，预览保持摄像头原始画面。 */
+   v1.5：现在只在「确实需要动亮度」时才挂 —— 用户拉过亮度滑块，或者
+   自动曝光归位算出的增益明显偏离 1（这时成片会被压暗，预览必须同步，
+   否则就是「看着白、拍出来白」各说各话）。阈值 0.10 避免无谓地挂滤镜。 */
 function toneFilter() {
   if (!window.WMCTone) return 'none';
-  if (Math.abs(manualExposure()) < 0.005) return 'none';
+  const manual = Math.abs(manualExposure()) > 0.005;
+  const gain = tone.lut ? (tone.lut.gain || 1) : 1;
+  const autoDamp = !!S.autoTone && Math.abs(gain - 1) > 0.10;
+  if (!manual && !autoDamp) return 'none';
   return WMCTone.previewFilter(tone.lut) || 'none';
 }
 
@@ -670,6 +861,7 @@ function applyToneLut(canvas) {
     devDiag.tone = {
       black: Math.round(lut.black), white: Math.round(lut.white),
       gamma: +(lut.gamma || 1).toFixed(2),
+      ev: +(lut.ev || 0).toFixed(2),
       wb: [lut.gains.r, lut.gains.g, lut.gains.b].map(v => +v.toFixed(2))
     };
   } catch (e) {
@@ -737,6 +929,7 @@ function renderDiag() {
   const toneTxt = !t ? '—'
     : (typeof t === 'string' ? t
       : 'black ' + t.black + ' / white ' + t.white + ' / γ ' + t.gamma +
+        ' / 曝光 ' + (t.ev > 0 ? '+' : '') + (t.ev == null ? 0 : t.ev) + 'EV' +
         (t.wb ? ' / WB ' + t.wb.join(',') : ''));
   el.innerHTML =
     '<div><span>预览流</span><b>' + (devDiag.stream || '—') + '</b></div>' +
@@ -938,11 +1131,31 @@ function coverRect(iw, ih, targetR) {
   return { x: 0, y: (ih - h) / 2, w: iw, h };
 }
 
+/* 把整幅素材转 90°：先转再裁，保证成片方向和取景器里看到的一致 */
+function rotateSource(src, deg) {
+  const w = src.videoWidth || src.width || 0;
+  const h = src.videoHeight || src.height || 0;
+  const c = document.createElement('canvas');
+  c.width = h;
+  c.height = w;
+  const x = c.getContext('2d');
+  x.imageSmoothingQuality = 'high';
+  x.translate(h / 2, w / 2);
+  x.rotate(deg * Math.PI / 180);
+  x.drawImage(src, -w / 2, -h / 2);
+  return { src: c, w: h, h: w };
+}
+
 /**
  * 合成画布：把取到的图按“所见即所得”画出来
- * 预览里看到什么（含前置镜像、变焦裁切、比例裁切），成片就是什么
+ * 预览里看到什么（含画面方向、前置镜像、变焦裁切、比例裁切），成片就是什么
  */
 function composeCanvas(raw) {
+  const rot = videoRotDeg();
+  if (rot) {
+    const r = rotateSource(raw.src, rot);
+    raw = Object.assign({}, raw, { src: r.src, w: r.w, h: r.h });
+  }
   const vw = stage.clientWidth, vh = stage.clientHeight;
   const targetR = (vw && vh) ? vw / vh : raw.w / raw.h;
 
@@ -1700,6 +1913,7 @@ function syncUI() {
   setSeg('segScale', String(S.wmScale));
   setSeg('segQuality', S.quality);
   setSeg('segSize', String(S.size));
+  setSeg('segRot', String(S.videoRot || 'auto'));
   setSeg('segCoord', S.coordFmt);
 
   $$('.style-item').forEach(it => it.classList.toggle('on', it.dataset.style === S.style));
@@ -1723,6 +1937,11 @@ function syncTools() {
   if (ev) ev.textContent = (S.ev > 0 ? '+' : '') + Number(S.ev).toFixed(1);
   const sl = document.getElementById('evSlider');
   if (sl && Number(sl.value) !== Number(S.ev)) sl.value = S.ev;
+  const ob = document.getElementById('btnOrient');
+  if (ob) {
+    ob.title = orient.auto ? '方向：自动' : '方向：已锁定';
+    ob.classList.toggle('on', !orient.auto);
+  }
 }
 
 async function fillFingerprint() {
@@ -1838,7 +2057,8 @@ function bindUI() {
     ['segScale', v => { S.wmScale = Number(v); }],
     ['segQuality', v => { S.quality = v; }],
     ['segSize', v => { S.size = v; }],
-    ['segCoord', v => { S.coordFmt = v; }]
+    ['segCoord', v => { S.coordFmt = v; }],
+    ['segRot', v => { S.videoRot = v; }]
   ];
   segs.forEach(([id, apply]) => {
     const box = document.getElementById(id);
@@ -1849,7 +2069,8 @@ function bindUI() {
       apply(b.dataset.v);
       saveSettings();
       syncUI();
-      renderOverlay();
+      if (id === 'segRot') { layoutStage(); renderOverlay(); }
+      else renderOverlay();
       if (id === 'segQuality' || id === 'segSize') startCamera(curDeviceId, { keepLenses: true });
     });
   });
@@ -1862,6 +2083,18 @@ function bindUI() {
   $('#btnSwitch').addEventListener('click', () => {
     facing = facing === 'environment' ? 'user' : 'environment';
     startCamera();
+  });
+
+  // 方向：自动 ⇄ 锁定当前
+  const btnOrient = $('#btnOrient');
+  if (btnOrient) btnOrient.addEventListener('click', async () => {
+    if (orient.auto) {
+      // 第一次进入「自动」之外的状态前，先确认拿得到传感器
+      await requestOrientPermission();
+      setOrientAuto(false);
+    } else {
+      setOrientAuto(true);
+    }
   });
   $('#lensBar').addEventListener('click', e => {
     const b = e.target.closest('.lens');
@@ -1924,9 +2157,13 @@ function bindUI() {
   if (evSlider) {
     evSlider.addEventListener('input', e => {
       S.ev = Number(e.target.value);
-      saveSettings();
+      // 不写入 localStorage：曝光补偿只对当前场景有效，跨会话记忆会害人
       syncTools();
       applyEv(S.ev);
+    });
+    evSlider.addEventListener('change', () => {
+      if (Math.abs(S.ev) >= 1.5) toast('EV ' + (S.ev > 0 ? '+' : '') + S.ev.toFixed(1) +
+        ' 偏高，画面容易发白；重启 App 会自动归零');
     });
   }
 
@@ -1974,6 +2211,7 @@ function boot() {
   bindUI();
   syncUI();
   initLevel();
+  initOrientation();
   initGeo();
   startCamera();
   setInterval(renderOverlay, 1000);
@@ -2021,28 +2259,16 @@ window.addEventListener('pagehide', camSleep);
 window.addEventListener('pageshow', () => { if (!document.hidden) camWake(); });
 
 /* ---------- 转屏 ----------
-   横竖屏切换后要做三件事：重算取景框尺寸、按新方向重摆水印、
-   按新方向重开一路分辨率合适的流（否则横屏还拿着竖屏的 3:4 流，画面只占中间一条）。 */
-let lastLand = isLandscape();
-let orientTimer = 0;
-
+   壳锁竖屏，系统不会给 orientationchange；真正驱动方向的是陀螺仪
+   （见 initOrientation）。这里只负责窗口尺寸变化（软键盘、分屏、
+   平板旋转）后的重排，不再重开摄像头 —— cover 已经能吃下任何比例，
+   重开一路流只会让画面闪一下、卡一下。 */
 function onOrientation() {
-  const land = isLandscape();
-  const flipped = land !== lastLand;
-  lastLand = land;
   layoutStage();
   renderOverlay();
-  if (!flipped) return;
-
-  clearTimeout(orientTimer);
-  orientTimer = setTimeout(() => {
-    if (camStarting || resuming || busy) return;
-    if (!video.srcObject) return;
-    startCamera(curDeviceId, { keepLenses: true });
-  }, 420);
 }
 
-window.addEventListener('orientationchange', onOrientation);
+window.addEventListener('orientationchange', () => setTimeout(onOrientation, 260));
 window.addEventListener('resize', onOrientation);
 
 video.addEventListener('loadedmetadata', layoutStage);

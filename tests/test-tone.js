@@ -76,12 +76,14 @@ ok('三条通道曲线都严格不下降', () => {
     }
   }
 });
-ok('黑端归零、白端触顶', () => {
+ok('黑端归零、白端留余量（不触顶）', () => {
   const lut = Tone.buildLut(Tone.analyze(img([
     { rgb: [30, 30, 30], count: 10 }, { rgb: GREY, count: 900 }, { rgb: [240, 240, 240], count: 90 }
   ]), 1), {});
   assert.ok(lut.r[0] <= 3, 'LUT[0]=' + lut.r[0]);
-  assert.strictEqual(lut.r[255], 255);
+  // v1.5 起白端渐近到 0.985 而不是硬顶 255：
+  // 触顶 255 意味着成片里出现一片 0 细节的死白，这正是「发白」的观感来源。
+  assert.ok(lut.r[255] >= 248 && lut.r[255] <= 253, 'LUT[255]=' + lut.r[255]);
 });
 
 console.log('\n[3] 对比度与亮度行为');

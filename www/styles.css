@@ -59,6 +59,11 @@ body{
   transition:transform .12s, background .15s;
 }
 .icon-btn:active{transform:scale(.94);background:#1c222d}
+/* 方向按钮：默认显示「自动旋转」图标，锁定后换成锁并高亮 */
+#btnOrient .ico-lock{display:none}
+body.orient-lock #btnOrient .ico-auto{display:none}
+body.orient-lock #btnOrient .ico-lock{display:block}
+body.orient-lock #btnOrient{color:var(--accent);border-color:rgba(255,210,74,.45);background:var(--accent-dim)}
 
 /* ---------- 取景器 ---------- */
 .stage-wrap{
@@ -92,7 +97,10 @@ body{
 }
 .stage video{
   width:100%;height:100%;
-  object-fit:contain;
+  /* cover 而不是 contain：摄像头给的流方向/比例未必和取景框一致，
+     contain 会在两侧或上下留大黑边（就是「取景框里画面小得可怜」），
+     cover 让画面始终填满取景框。 */
+  object-fit:cover;
   background:#000;
   display:block;
 }
@@ -841,49 +849,72 @@ textarea::placeholder{color:#5d6675}
 .preview-bar .btn-primary,.preview-bar .btn-ghost{padding-left:14px;padding-right:14px;font-size:13px}
 
 
-/* ---------- 横屏 ----------
-   横屏时高度只剩一半，原来那套竖排留白会把取景器压成一条缝。
-   这里压掉纵向内边距、把工具条收紧成纯图标，把高度还给画面。 */
-@media (orientation: landscape) and (max-height: 620px){
-  /* 横屏时高度只剩竖屏的一半，任何占文档流的控件都是从画面里直接抢高度。
-     控制条和工具条一律改浮层，高度全部还给取景器。 */
-  #app{position:relative;overflow:hidden}
-  .stage-wrap{padding:0}
-  .stage-col{gap:0;position:relative}
-  .stage{border-radius:0}
+/* ---------- 横屏（由 JS 的陀螺仪判定驱动） ----------
+   注意：不能用 @media (orientation:landscape) —— 壳把 Activity 钉死在
+   竖屏，系统永远不会给出横屏视口，那个媒体查询在本 App 里是死的。
+   现在由 app.js 读陀螺仪后给 <body> 加 .land / .q90 / .q270，
+   整个 #app 用 CSS 旋转 90°，等于自己实现了一次屏幕旋转。 */
 
-  .controls{
-    position:absolute;left:0;right:0;bottom:0;
-    padding:8px 0 calc(6px + var(--safe-b));
-    background:linear-gradient(to top, rgba(4,6,10,.66), rgba(4,6,10,0));
-    pointer-events:none;
-    gap:40px;
-  }
-  .controls>*{pointer-events:auto}
-
-  /* 工具条浮到左上，且只占左侧不到一半宽度 ——
-     右边整块留给水印（横屏时水印自动挪到右上角），互不遮挡。
-     去掉 backdrop-filter：横屏每帧都要额外做一次模糊，属于纯浪费。 */
-  .bars{
-    position:absolute;top:6px;left:8px;right:auto;z-index:6;
-    width:auto;max-width:42%;
-    flex-direction:row;align-items:flex-start;gap:6px;
-    padding:0;background:none;
-  }
-  .toolbar{background:rgba(10,14,20,.42);padding:2px 5px;gap:2px}
-  .tool{padding:5px 8px;gap:0}
-  .tool span{display:none}
-  .style-btn{padding:5px 10px;font-size:12px;gap:5px}
-  .style-btn b{font-size:11px}
-
-  .topbar{padding:2px 12px}
-  .brand-txt{display:none}
-  .icon-btn{width:32px;height:32px}
-
-  .shutter{width:56px;height:56px}
-  .shutter span{width:44px;height:44px}
-  .side-btn{width:44px;gap:0}
-  .side-btn span{display:none}
-  .side-btn svg{width:20px;height:20px}
-  .level-wrap{width:min(42%,200px)}
+/* 顺时针转：宽高互换后，rotate(90) + 右移一个自身高度，正好铺满视口 */
+body.q90 #app{
+  position:fixed;left:0;top:0;
+  width:100vh;height:100vw;
+  transform-origin:0 0;
+  transform:rotate(90deg) translateY(-100%);
 }
+/* 逆时针转 */
+body.q270 #app{
+  position:fixed;left:0;top:0;
+  width:100vh;height:100vw;
+  transform-origin:0 0;
+  transform:rotate(-90deg) translateX(-100%);
+}
+
+/* 横屏时高度只剩一半，原来那套竖排留白会把取景器压成一条缝。
+   这里压掉纵向内边距、把工具条收紧成纯图标，把高度还给画面。 */
+body.land #app{position:fixed;overflow:hidden}
+body.land .stage-wrap{padding:0}
+body.land .stage-col{gap:0;position:relative}
+body.land .stage{border-radius:0}
+
+body.land .controls{
+  position:absolute;left:0;right:0;bottom:0;
+  padding:8px 0 calc(6px + var(--safe-b));
+  background:linear-gradient(to top, rgba(4,6,10,.66), rgba(4,6,10,0));
+  pointer-events:none;
+  gap:40px;
+}
+body.land .controls>*{pointer-events:auto}
+
+/* 工具条浮到左上，且只占左侧不到一半宽度 ——
+   右边整块留给水印（横屏时水印自动挪到右上角），互不遮挡。
+   去掉 backdrop-filter：横屏每帧都要额外做一次模糊，属于纯浪费。 */
+body.land .bars{
+  position:absolute;top:50px;left:8px;right:auto;z-index:6;
+  width:auto;max-width:46%;
+  flex-direction:row;align-items:flex-start;gap:6px;
+  padding:0;background:none;
+}
+body.land .toolbar{background:rgba(10,14,20,.42);padding:2px 5px;gap:2px}
+body.land .tool{padding:5px 8px;gap:0}
+body.land .tool span{display:none}
+body.land .style-btn{padding:5px 10px;font-size:12px;gap:5px}
+body.land .style-btn b{font-size:11px}
+
+body.land .topbar{
+  position:absolute;top:0;left:0;right:auto;z-index:7;
+  padding:6px 10px;gap:8px;
+  background:none;
+  pointer-events:none;
+}
+body.land .topbar>*{pointer-events:auto}
+/* 横屏不显示标题：转 90° 之后它会变成一竖行贴边文字，纯属干扰 */
+body.land .brand{display:none}
+body.land .icon-btn{width:32px;height:32px}
+
+body.land .shutter{width:56px;height:56px}
+body.land .shutter span{width:44px;height:44px}
+body.land .side-btn{width:44px;gap:0}
+body.land .side-btn span{display:none}
+body.land .side-btn svg{width:20px;height:20px}
+body.land .level-wrap{width:min(42%,200px)}

@@ -211,7 +211,7 @@
 
   /* ---------------- 样式：经典左竖条 ---------------- */
   function drawClassic(ctx, W, H, d, o) {
-    const s = W / 1080, sc = o.scale, P = o.P;
+    const s = Math.min(W, H) / 1080, sc = o.scale, P = o.P;
     const L = buildLines(d, o.s, sc, P, s);
     if (!L.length) return;
     const padX = 54 * s, padY = 62 * s;
@@ -254,7 +254,7 @@
 
   /* ---------------- 样式：半透明卡片 ---------------- */
   function drawCard(ctx, W, H, d, o) {
-    const s = W / 1080, sc = o.scale, P = o.P;
+    const s = Math.min(W, H) / 1080, sc = o.scale, P = o.P;
     const L = buildLines(d, o.s, sc, P, s);
     if (!L.length) return;
     const inner = 32 * s;
@@ -292,7 +292,7 @@
 
   /* ---------------- 样式：大字时间 ---------------- */
   function drawHero(ctx, W, H, d, o) {
-    const s = W / 1080, sc = o.scale, P = o.P;
+    const s = Math.min(W, H) / 1080, sc = o.scale, P = o.P;
     const L = [];
     const push = (t, size, weight, gap, cls) => { if (t) L.push({ t, size: size * sc * s, weight, gap: gap * sc * s, cls }); };
     if (d.title) push(d.title, 38, 700, 8, 'title');
@@ -334,7 +334,7 @@
 
   /* ---------------- 样式：记录条（左大时间 + 右信息列） ---------------- */
   function drawStrip(ctx, W, H, d, o) {
-    const s = W / 1080, sc = o.scale, P = o.P, S = o.s;
+    const s = Math.min(W, H) / 1080, sc = o.scale, P = o.P, S = o.s;
     const padX = 54 * s, padY = 62 * s;
     const timeSize = 72 * sc * s, dateSize = 26 * sc * s, smallSize = 25 * sc * s;
 
@@ -416,7 +416,7 @@
 
   /* ---------------- 样式：底部横幅（雾面玻璃带） ---------------- */
   function drawTag(ctx, W, H, d, o) {
-    const s = W / 1080, sc = o.scale, P = o.P, S = o.s;
+    const s = Math.min(W, H) / 1080, sc = o.scale, P = o.P, S = o.s;
     const padX = 40 * s;
     const boxW = W - padX * 2;
 
@@ -500,7 +500,7 @@
 
   /* ---------------- 样式：极简右下角 ---------------- */
   function drawMinimal(ctx, W, H, d, o) {
-    const s = W / 1080, sc = o.scale, P = o.P, S = o.s;
+    const s = Math.min(W, H) / 1080, sc = o.scale, P = o.P, S = o.s;
     const padX = 56 * s, padY = 64 * s;
     const L = [];
     const push = (t, size, weight, gap, cls) => { if (t) L.push({ t, size: size * sc * s, weight, gap: gap * s, cls }); };
@@ -546,7 +546,7 @@
 
   /* ---------------- 样式：左上角标签（胶囊） ---------------- */
   function drawBadge(ctx, W, H, d, o) {
-    const s = W / 1080, sc = o.scale, P = o.P, S = o.s;
+    const s = Math.min(W, H) / 1080, sc = o.scale, P = o.P, S = o.s;
     const pad = 46 * s;
     const L1 = [];
     if (S.showTime && d.timeText) L1.push({ t: d.timeText, size: 30 * sc * s, weight: 700, cls: 'title' });
@@ -616,7 +616,7 @@
 
   /* ---------------- 样式：印章（右下角圆角框 + 大字时间） ---------------- */
   function drawStamp(ctx, W, H, d, o) {
-    const s = W / 1080, sc = o.scale, P = o.P, S = o.s;
+    const s = Math.min(W, H) / 1080, sc = o.scale, P = o.P, S = o.s;
     const pad = 52 * s;
     const padX = 34 * s, padY = 26 * s;
 
@@ -736,7 +736,7 @@
     try {
       const ext = measureExtent(W, H, d, o, fn);
       if (ext) {
-        const pad = 44 * (W / 1080);
+        const pad = 44 * (Math.min(W, H) / 1080);
         const availH = H - pad * 2;
         const contentH = (ext.maxY - ext.minY) + ext.lastSize * 1.3;
         if (contentH > availH && contentH > 0) {

@@ -126,7 +126,7 @@
   /* 生成 3 条 256 项查找表。
      opts.exposure: 用户手动亮度 (-1..+1)
      opts.wb: 是否做白平衡
-     opts.contrast: S 曲线强度 0..1（默认 0.32）
+     opts.contrast: S 曲线强度 0..1（默认 0.30）
 
      思路来自三条线：
      · Reza/Zuiderveld 的 CLAHE 指出，低对比图像的病灶是「直方图过度集中」，
@@ -136,64 +136,106 @@
      · Hasinoff 的 HDR+ 在合并后套标准 tone mapping，
        关键是把黑场和白场各自归位，而不是整体乘一个系数。
 
-     所以这里做成三段：黑场归位 → 中位锚定 + S 曲线 → 高光软膝。 */
+     ------------------------------------------------------------
+     v1.5 的关键修正 —— 为什么之前「完全没解决」：
+
+     旧版只有「曲线重塑」（黑场归位 + 伽马锚中位 + S 曲线），伽马被死死
+     钳在 [0.72, 1.38]。但一张过曝的图（中位 0.85）若想锚到 0.46，需要
+     伽马 4.7；钳到 1.38 只能压到 0.79 —— 等于没压。所以曲线再花哨，
+     输入本来就白，输出必然还是白。
+
+     现在补上真正缺的那一环：**线性曝光归位**。按中位亮度算出「需要补
+     几档曝光」（log2(目标/当前)），在归一化之后先乘这个增益，再进曲线。
+     这样过曝图会真的暗下来，而不是被曲线「重新分配」一遍亮度。
+
+     归位只在「确实过曝」时触发（中位 > 0.60、或 p95 > 0.88、或高光溢出），
+     正常图和夜景不动 —— 无条件锚中位会把夜景强行拉成白天，那是另一种错。
+     ------------------------------------------------------------ */
   function buildLut(s, opts) {
     const o = opts || {};
     const on = !!(s && s.n);
     const exposure = clamp(o.exposure || 0, -1, 1);
-    const contrast = clamp(o.contrast == null ? 0.32 : o.contrast, 0, 1);
+    const contrast = clamp(o.contrast == null ? 0.22 : o.contrast, 0, 1);
     const useWb = o.wb !== false;
 
-    // 黑场：1% 分位。只回收 60%，留一点脚，避免暗部被压成死黑一片。
-    const black = on ? clamp(s.p1 * 255 * 0.6, 0, 22) : 0;
+    // 黑场：1% 分位，只回收 55%，留一点脚，避免暗部被压成死黑一片。
+    const black = on ? clamp(s.p1 * 255 * 0.55, 0, 24) : 0;
 
-    // 白场：优先用 99.5 分位。但若 p99.5 远高于 p98，说明那只是零星高光
-    //（屏幕反光、灯珠），拿它当白场会把整幅压在下面，高光永远顶不上去。
-    // 这种「长尾」分布改用 p98 加余量，让主体高光真正展开。
+    // 白场：让 p99.5 落在 0.94 而不是 1.0。
+    // 这个 0.06 的余量是给后面的 S 曲线留的 —— 锚到 1.0 再走 S 曲线，
+    // 亮部会被顶出 255，成片就出现一片死白（实测原生 217 被推到 249）。
     let white = 255;
     if (on) {
       const hi995 = (s.p995 || 1) * 255;
       const hi98 = (s.p98 || 1) * 255;
-      const useHi = (hi995 - hi98 > 60) ? hi98 + 40 : hi995;
-      white = clamp(useHi, 168, 255);
+      // 零星反光（p99.5 远高于 p98）不当白场，否则整幅被压下去
+      const useHi = (hi995 - hi98 > 55) ? hi98 + 30 : hi995;
+      white = useHi / 0.94;
+      white = clamp(white, Math.max(black + 60, 176), 255);
     }
     if (white - black < 60) white = Math.min(255, black + 60);
 
-    // 中位锚定：把 50% 分位送到 0.46 附近，整体明暗就不偏了。
-    // 伽马限制在 [0.72, 1.38]，天黑场景不会被硬拉成白天。
+    // ---- 线性曝光归位 ----
+    // 只在「确实过曝」时压：中位 > 0.58、或 p95 > 0.90、或已有高光溢出。
+    // 正常图和夜景一律不动，避免把夜景强行拉成白天（那是另一种「假」）。
+    let ev = 0;
+    let evReason = 'off';
+    if (on) {
+      const mid = clamp(((s.p50 || 0.5) * 255 - black) / (white - black), 0.02, 1.3);
+      const hot = Math.max(
+        (s.p50 || 0) / 0.58,
+        (s.p95 || 0) / 0.90,
+        (s.blown || 0) / 0.010
+      );
+      if (hot > 1 && mid > 0.44) {
+        ev = clamp(Math.log2(0.47 / mid), -1.8, 0);
+        evReason = 'damp';
+        // 成片大面积死白（>4% 像素顶到 250+）再多压一点：那部分信息已经没了，
+        // 只能靠整体降曝光把中间调层次抢回来。
+        if (s.blown > 0.04) { ev = clamp(ev - 0.2, -2.0, 0); evReason = 'damp+'; }
+      }
+    }
+    const gain = Math.pow(2, clamp(ev + exposure * 0.85, -2.1, 1.1));
+
+    // ---- 伽马：把中位轻推回 0.50 ----
+    // 这一步只做「微调」，所以范围收得很窄（0.92~1.25）。
+    // 真正的大幅明暗变化交给上面的线性归位，那才是符合相机语义的做法。
     let gamma = 1;
     if (on) {
-      const mid = clamp(((s.p50 || 0.5) * 255 - black) / (white - black), 0.02, 0.98);
-      gamma = clamp(Math.log(0.46) / Math.log(mid), 0.72, 1.38);
+      const mid = clamp(((s.p50 || 0.5) * 255 - black) / (white - black), 0.02, 1.3) * gain;
+      if (mid > 0.02 && mid < 0.98) {
+        gamma = clamp(Math.log(0.50) / Math.log(clamp(mid, 0.05, 0.95)), 0.92, 1.25);
+      }
     }
-    // 手动曝光以伽马形式叠加，和自动曲线共用一条通道
-    gamma = clamp(gamma / Math.pow(2, exposure * 0.9), 0.55, 2.2);
 
-    const knee = 0.84;
+    const knee = 0.88;
     const g2 = useWb ? grayGains(s) : { r: 1, g: 1, b: 1 };
 
     const mk = (chGain) => {
       const t = new Uint8Array(256);
       for (let v = 0; v < 256; v++) {
-        // ① 归一化 + 伽马（抬中间调）
-        let x = clamp((v - black) / Math.max(8, white - black), 0, 1);
+        // ① 黑场归位 + 归一化（白场已按 0.94 预留高光余量）
+        let x = clamp((v - black) / Math.max(8, white - black), 0, 1.25);
+        // ② 曝光归位：这一步才是「不白」的关键
+        x = clamp(x * gain, 0, 1);
+        // ③ 伽马微调中位
         x = Math.pow(x, gamma);
-        // ② S 曲线：暗部再压一点、亮部再抬一点，产出「通透」而不是「灰」
+        // ④ 弱 S 曲线：只加一点点通透感，强度压到 0.22
         const sm = x * x * (3 - 2 * x);
         x = x * (1 - contrast) + sm * contrast;
-        // ③ 高光软膝，防止 S 曲线把亮部顶爆
+        // ⑤ 高光软膝：渐近到 0.985，绝不触顶 1.0
         if (x > knee) {
           const u = (x - knee) / (1 - knee);
-          const k = 1 - Math.exp(-u * 2.4);
-          const kd = 1 - Math.exp(-2.4);
-          x = knee + (1 - knee) * (k / kd);
+          const k = 1 - Math.exp(-u * 3.2);
+          const kd = 1 - Math.exp(-3.2);
+          x = knee + (0.985 - knee) * (k / kd);
         }
         t[v] = clamp(Math.round(x * 255 * chGain), 0, 255);
       }
       return t;
     };
 
-    return { r: mk(g2.r), g: mk(g2.g), b: mk(g2.b), black, white, gamma, gains: g2 };
+    return { r: mk(g2.r), g: mk(g2.g), b: mk(g2.b), black, white, gain, ev, gamma, evReason, gains: g2 };
   }
 
   /* 把 LUT 应用到 ImageData（原地）。纯查表，无浮点运算。 */
@@ -208,16 +250,15 @@
   }
 
   /* ---------------- 取景预览用的近似 ----------------
-     CSS filter 做不了查表，用 contrast 近似「去灰」那一段，
-     不做全局压暗（那正是之前把画面压灰的原因）。
-     预览只是参考，成片走 applyLut 会更准。 */
+     CSS filter 做不了查表，用 contrast + brightness 近似。
+     其中 brightness 直接取曲线算出的曝光增益 —— 这是「所见即所得」的关键：
+     自动归位把成片压暗了，预览必须同步压暗，否则用户看到的和拍到的不一样。 */
   function previewFilter(lut) {
     if (!lut) return 'none';
     const span = Math.max(40, lut.white - lut.black);
-    const c = clamp(255 / span, 1, 1.42);
+    const c = clamp(255 / span, 1, 1.35);
     const avgGain = (lut.gains.r + lut.gains.g + lut.gains.b) / 3;
-    // 用亮度偏移把画面居中，避免 contrast 直接拉爆高光
-    const b = clamp(avgGain * (lut.b ? 1 : 1), 0.85, 1.15);
+    const b = clamp((lut.gain || 1) * avgGain, 0.4, 1.2);
     if (Math.abs(c - 1) < 0.02 && Math.abs(b - 1) < 0.02) return 'none';
     return 'contrast(' + c.toFixed(3) + ') brightness(' + b.toFixed(3) + ')';
   }
