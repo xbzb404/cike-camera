@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.3.1';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -1369,18 +1369,23 @@ function sizeStyleThumbs() {
 function paintStyleThumbs() {
   const grid = $('#styleGrid');
   if (!grid) return;
-  const sz = sizeStyleThumbs() || { w: 340, h: 340 };
-  const base = snapshotFrame(sz.w, sz.h);
+  sizeStyleThumbs();
+  // 缩略图 canvas 的「绘制尺寸」是 dpr 放大后的像素（例如 170 CSS px × 3 = 510），
+  // 底图与坐标都必须用同一个尺寸，否则底图只铺左上角、文字按整张算 → 字看着超大并溢出。
+  const c0 = grid.querySelector('.style-item canvas');
+  const bw = (c0 && c0.width) || 340;
+  const bh = (c0 && c0.height) || 340;
+  const base = snapshotFrame(bw, bh);
   const d = WM.buildData(displayBase(liveBase()), S, uiCode);
   let ink = 'dark';
   if (S.autoInk) {
-    try { ink = WM.measureInk(base.getContext('2d'), sz.w, sz.h, S.pos === 'top' ? 'top' : 'bottom'); } catch (e) {}
+    try { ink = WM.measureInk(base.getContext('2d'), bw, bh, S.pos === 'top' ? 'top' : 'bottom'); } catch (e) {}
   }
   grid.querySelectorAll('.style-item').forEach(item => {
     const c = item.querySelector('canvas');
     const ctx = c.getContext('2d');
     ctx.clearRect(0, 0, c.width, c.height);
-    ctx.drawImage(base, 0, 0);
+    ctx.drawImage(base, 0, 0, c.width, c.height);
     WM.draw(ctx, c.width, c.height, d, {
       style: item.dataset.style, pos: S.pos, scale: S.wmScale, ink, s: S
     });

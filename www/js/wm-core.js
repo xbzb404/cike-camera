@@ -165,11 +165,13 @@
     };
   }
 
-  /* ---------------- 行模型 ---------------- */
-  function buildLines(d, s, sc, P) {
+  /* ---------------- 行模型 ----------------
+     u = 画布单位（W / 1080）。字号与行距都必须乘上它，
+     否则在缩略图这类非 1080 宽的画布上，字会按 1080 的绝对像素画，看着大得离谱。 */
+  function buildLines(d, s, sc, P, u) {
     const L = [];
     const push = (t, size, weight, gap, cls) => {
-      if (t) L.push({ t, size: size * sc, weight, gap: gap * sc, cls: cls || '' });
+      if (t) L.push({ t, size: size * sc * u, weight, gap: gap * sc * u, cls: cls || '' });
     };
     if (d.title) push(d.title, 44, 700, 14, 'title');
     if (s.showTime && d.timeText) push(d.timeText, 31, 500, 6, 'body');
@@ -202,7 +204,7 @@
   /* ---------------- 样式：经典左竖条 ---------------- */
   function drawClassic(ctx, W, H, d, o) {
     const s = W / 1080, sc = o.scale, P = o.P;
-    const L = buildLines(d, o.s, sc, P);
+    const L = buildLines(d, o.s, sc, P, s);
     if (!L.length) return;
     const padX = 54 * s, padY = 62 * s;
     const totalH = blockHeight(L);
@@ -245,7 +247,7 @@
   /* ---------------- 样式：半透明卡片 ---------------- */
   function drawCard(ctx, W, H, d, o) {
     const s = W / 1080, sc = o.scale, P = o.P;
-    const L = buildLines(d, o.s, sc, P);
+    const L = buildLines(d, o.s, sc, P, s);
     if (!L.length) return;
     const inner = 32 * s;
     const totalH = blockHeight(L);
@@ -284,7 +286,7 @@
   function drawHero(ctx, W, H, d, o) {
     const s = W / 1080, sc = o.scale, P = o.P;
     const L = [];
-    const push = (t, size, weight, gap, cls) => { if (t) L.push({ t, size: size * sc, weight, gap: gap * sc, cls }); };
+    const push = (t, size, weight, gap, cls) => { if (t) L.push({ t, size: size * sc * s, weight, gap: gap * sc * s, cls }); };
     if (d.title) push(d.title, 38, 700, 8, 'title');
     if (o.s.showPlace && d.location) push(d.location, 33, 500, 4, 'body');
     if (o.s.showCoords && d.coords) push(d.coords, 28, 500, 8, 'body');

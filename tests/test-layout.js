@@ -152,6 +152,33 @@ for (const meta of WM.STYLES) {
   }
 }
 
+/* ---------------- ③ 缩放一致性 ----------------
+   同一份内容在不同画布宽度上，字号必须与宽度成正比（±2%）。
+   这条专门防「缩略图里字大得离谱」这类 bug：只要某个样式漏乘 W/1080，
+   在小画布上算出来的字号就会接近 1080 下的绝对值，比例立刻对不上。 */
+{
+  const REF = 1080;
+  function firstFontSize(style, W, H) {
+    const ctx = fakeCtx(W, H);
+    WM.draw(ctx, W, H, d, { style, pos: 'bottom', scale: 1, ink: 'dark', s: S });
+    const t = ctx.__texts[0];
+    return t ? t.size : 0;
+  }
+  for (const meta of WM.STYLES) {
+    for (const W of [2160, 540, 420]) {
+      const ref = firstFontSize(meta.id, REF, Math.round(REF * 1.333));
+      const got = firstFontSize(meta.id, W, Math.round(W * 1.333));
+      const want = ref * (W / REF);
+      const errs = [];
+      if (!ref || !got) errs.push(`没有画出任何文字（ref=${ref} got=${got}）`);
+      else if (Math.abs(got - want) > want * 0.02) {
+        errs.push(`字号未随画布缩放：W=${W} 得到 ${got.toFixed(1)}px，应为 ${want.toFixed(1)}px（1080 下 ${ref.toFixed(1)}px）`);
+      }
+      report(`缩放一致性 ${meta.id} / W=${W}`, errs);
+    }
+  }
+}
+
 /* 帮助函数：借用同尺寸量宽 */
 function fakeMeasure(size) {
   return {
