@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.5.2';
+const APP_VERSION = '1.5.3';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -808,6 +808,30 @@ const orient = {
   hasSensor: false
 };
 
+/* 原生方向锁（壳里的 WMCAndroid.setOrientation）。
+   ------------------------------------------------------------
+   1.5.3 之前「锁定」只是网页层不再听陀螺仪 —— 可窗口是 fullSensor，
+   系统照样把窗口转过去，我们只能 CSS 反向转 90° 把界面「摆正」。
+   结果就是用户看到的：明明锁了，转手机整个界面跟着倒，还闪一下重排。
+
+   真正锁死只能回到原生：Activity.setRequestedOrientation()。
+   （WebView 里的 screen.orientation.lock() 是死路 —— Chromium 明确表示
+   安卓 WebView 不支持，调用必抛异常。）
+     14 = SCREEN_ORIENTATION_LOCKED  钉在「当前这个方向」，转手机窗口不动
+      4 = SCREEN_ORIENTATION_SENSOR  恢复跟随重力（壳清单里的默认值）
+   浏览器里预览没有这个桥，返回 false，退回下面那段 CSS 自转兜底。 */
+const ORIENT_LOCKED = 14;
+const ORIENT_SENSOR = 4;
+function nativeOrient(v) {
+  try {
+    if (window.WMCAndroid && typeof WMCAndroid.setOrientation === 'function') {
+      WMCAndroid.setOrientation(v);
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
 let selfRot = 0;          // 我们自己把 #app 转了多少度（0 = 没转）
 let logicalLand = false;  // 当前界面按横屏还是竖屏排版
 let pendLand = null;      // 设备已经转过去、但系统窗口还没转的过渡态
@@ -972,6 +996,9 @@ function initOrientation() {
     if (orient.candN < 3) return;       // 连续 3 帧同一方向才认，防手抖
     if (q === orient.q) return;
     orient.q = q;
+    // 锁定后：姿态照样记下来（解锁时要用），但**绝不触发重排**。
+    // 以前这里只是「不用于自动转屏」，可窗口被系统转走时兜底逻辑
+    // 还是按陀螺仪把界面翻 90°，用户看到的就是「锁了还在跟着转」。
     if (!orient.auto) return;
 
     const dLand = deviceLand();
@@ -1017,17 +1044,24 @@ async function requestOrientPermission() {
 function setOrientAuto(on) {
   orient.auto = on;
   pendLand = null;
+  clearTimeout(rotTimer);
+  rotTimer = 0;
   if (!on) {
-    // 锁的是「现在看到的这个方向」，而不是陀螺仪读数（手机平放时读数是 0）
-    orient.lockedQ = logicalLand
-      ? ((orient.q === 90 || orient.q === -90) ? orient.q : 90)
-      : 0;
-    toast('已锁定：' + (orient.lockedQ ? '横屏' : '竖屏') + '（手机转动不再跟随）');
+    // 锁的是「现在看到的这个方向」。判断依据是窗口（= 用户眼睛里的画面），
+    // 不是陀螺仪读数 —— 手机平放时读数是 0，会把横屏锁成竖屏。
+    orient.lockedQ = winLand() ? 90 : 0;
+    nativeOrient(ORIENT_LOCKED);
+    toast('已锁定：' + (orient.lockedQ ? '横屏' : '竖屏') + '（屏幕已钉死，转手机不再跟随）');
   } else {
+    nativeOrient(ORIENT_SENSOR);
+    // 解锁瞬间设备可能已经横着、而窗口还钉在竖屏（原生锁刚放开）。
+    // 给兜底逻辑一个「设备转了、窗口没转」的初始状态：系统随后自己
+    // 转窗口时会清掉 pendLand，不会出现双重旋转。
+    pendLand = deviceLand() === winLand() ? null : deviceLand();
     toast('已恢复自动旋转');
   }
   document.body.classList.toggle('orient-lock', !on);
-  applyOrientation();
+  applyOrientation({ gyro: !on && pendLand !== null });
   syncTools();
 }
 

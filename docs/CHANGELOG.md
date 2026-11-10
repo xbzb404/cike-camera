@@ -1,5 +1,38 @@
 # 变更记录
 
+## v1.5.3 · 2026-11-10
+
+### 方向锁定改成真正锁窗口（原生）
+用户反馈：锁了以后转手机界面照样跟着倒、还闪一下像刷新。
+根因是「锁定」只做了网页层的一半 —— 不跟随陀螺仪了，但壳是
+`screenOrientation=4`（sensor），系统照样把窗口转过去，页面只能再
+CSS 反向转 90° 把界面「摆正」，看起来就是整套界面被硬转了一下。
+
+这一版把锁定下沉到原生：
+
+- 壳里新增 `WMCAndroid.setOrientation(int)`（`Bridge.setOrientation`），
+  经 `runOnUiThread` 调 `Activity.setRequestedOrientation`；
+- 锁定 → 传 **14（SCREEN_ORIENTATION_LOCKED）**：钉在当前方向，转手机
+  窗口一动不动；解除 → 传 **4（SENSOR）** 恢复跟随重力；
+- 网页层在锁定状态下不再因陀螺仪触发任何重排（姿态只记不用），
+  解锁时再用记下的姿态把界面摆正；
+- 浏览器里预览（没有原生桥）时自动退回原来的 CSS 自转兜底。
+
+顺带说明：WebView 里的 `screen.orientation.lock()` 是死路，Chromium
+明确表示安卓 WebView 不支持，调用必抛异常 —— 所以必须走原生。
+
+### 状态栏自动收起
+`MainActivity.onCreate` 里给 Window 挂 `FLAG_FULLSCREEN`（0x400）：
+顶部的系统状态栏（时间 / 通知图标）不再常驻，取景吃满整屏，横屏也
+不再被它压掉一条高度。
+
+### 工程
+- 壳的代码现在以 smali 形式放进仓库（`shell/smali/`），
+  `python tools/build_dex.py` 一键汇编回 `shell/classes.dex`
+  （工具链首次运行自动下到 `build/.tools/smali/`）；
+- 新增 `tests/test-orient-lock.js`：验证锁定/解锁时的原生调用值与
+  「锁定后陀螺仪不影响排版」。
+
 ## v1.5.2 · 2026-11-10
 
 ### 横屏重新排版：工具条去左上角，快门到右边
