@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.5.1';
+const APP_VERSION = '1.5.2';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -883,6 +883,11 @@ function applyOrientation(opts) {
   body.classList.toggle('q270', want === -90);
   body.classList.toggle('selfrot', want !== 0);
   body.classList.toggle('land', logicalLand);
+  // 沉浸式 = 取景铺满整屏、控件浮在画面上（全屏 / 横屏）。
+  // 横屏也算沉浸式：横过来以后控件不再各占一行，而是浮在画面两侧的
+  // 控件栏里 —— 竖屏那套竖排结构压扁在 2.4:1 的窗口里，取景框只剩
+  // 屏幕的 1/5，用户看到的就是「一片黑里一个巴掌大的小窗」。
+  body.classList.toggle('immersive', !!S.full || logicalLand);
 
   // 旋转时把 #app 的宽高写成显式像素，别让 CSS 的 100vh/100vw 在某些
   // WebView 上算偏（写死之后 layoutStage 的推算和实际盒子一定一致）
@@ -1040,7 +1045,8 @@ function setFull(on) {
   document.body.classList.toggle('full', S.full);
   applyOrientation();
   syncTools();
-  toast(S.full ? '全屏取景（点右上角按钮退出）' : '已退出全屏');
+  // 横屏没有单独的退出按钮，右上角那个四角图标自己就能关
+  toast(S.full ? '全屏取景（点右上角的四角图标退出）' : '已退出全屏');
 }
 
 function layoutStage() {
@@ -1054,10 +1060,10 @@ function layoutStage() {
   const padB = parseFloat(cs.paddingBottom) || 0;
 
   let availW, availH;
-  if (rot || full) {
-    // 自己转过 90°：元素盒子的宽高已经被换成 (视口高, 视口宽)，
+  if (rot || full || land) {
+    // 自己转过 90° / 全屏 / 横屏：取景容器已经脱离文档流（绝对定位），
     // 这时量 clientWidth 会拿到旋转前的旧值，必须用视口尺寸推算。
-    // 全屏同理：取景要吃满整屏，不按文档流里剩下的高度算。
+    // 横屏的左右两条控件栏写在 .stage-wrap 的 padding 里，下面统一扣掉。
     const sp = appSpace();
     availW = sp.w - padL - padR;
     availH = sp.h - padT - padB;
@@ -1073,8 +1079,8 @@ function layoutStage() {
   } else {
     availW = stageWrap.clientWidth - padL - padR;
     availH = stageWrap.clientHeight - padT - padB;
-    // 工具条现在竖屏横屏都待在文档流里（横屏不再搬去左侧黑边），
-    // 它占掉的那一行必须从可用高度里扣出来，否则取景框会顶到它底下。
+    // 工具条竖屏时待在文档流里，它占掉的那一行必须从可用高度里扣出来，
+    // 否则取景框会顶到它底下。
     const bar = $('.bars');
     if (bar) availH -= bar.offsetHeight + 10;
   }
@@ -1082,7 +1088,7 @@ function layoutStage() {
 
   // 取景框尺寸固定、方向跟着转 —— 不是「横屏就把框拉成一条扁带」。
   //   竖屏：3:4，按宽度撑开；
-  //   横屏：4:3，就是竖屏那张框转 90°，按高度反算（宽度不会被拉满）；
+  //   横屏：4:3，按高度撑开（左右两条控件栏之外全给画面，能拍多少拍多少）；
   //   全屏：铺满整屏（全屏本来就是「画面最大」的模式）。
   // 注意不是「按视频流比例排版」：那会让 4:3 的流在竖屏里缩成一条矮带。
   let w, h;
@@ -1185,11 +1191,25 @@ function renderOverlay() {
   // 水印老老实实贴角就行。
   ctx.save();
   if (S.full) {
-    const topEl = $('.topbar'), botEl = $('.controls');
-    const topH = topEl ? topEl.offsetHeight : 0;
-    const botH = botEl ? botEl.offsetHeight : 0;
-    const shift = isTopPos(pos) ? topH + 12 : -(botH + 10);
-    if (shift) ctx.translate(0, shift);
+    if (logicalLand) {
+      // 横屏全屏：画面吃满整屏，左边的工具条、右下角的图库/定位都压在
+      // 画面上。水印只往画面内侧让一点（竖向让开上下两条控件带），角还是
+      // 原来那个角 —— 绝不换角，这是用户明确要求过的。
+      const st = stage.getBoundingClientRect();
+      const barsEl = $('.bars'), galEl = $('#btnGallery');
+      const topBand = barsEl
+        ? Math.max(0, Math.round(barsEl.getBoundingClientRect().bottom - st.top)) : 0;
+      const botBand = galEl
+        ? Math.max(0, Math.round(st.bottom - galEl.getBoundingClientRect().top)) : 0;
+      const dy = isTopPos(pos) ? topBand + 10 : -(botBand + 8);
+      if (dy) ctx.translate(0, dy);
+    } else {
+      const topEl = $('.topbar'), botEl = $('.controls');
+      const topH = topEl ? topEl.offsetHeight : 0;
+      const botH = botEl ? botEl.offsetHeight : 0;
+      const shift = isTopPos(pos) ? topH + 12 : -(botH + 10);
+      if (shift) ctx.translate(0, shift);
+    }
   }
   // 预览水印按画面短边缩放（成片同一套算法）。横屏取景框短边只有 270 左右，
   // 直接按比例算会比竖屏小一圈、贴角看着像「缩进角落的小字」。

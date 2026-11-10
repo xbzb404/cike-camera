@@ -64,6 +64,9 @@ body{
 body.orient-lock #btnOrient .ico-auto{display:none}
 body.orient-lock #btnOrient .ico-lock{display:block}
 body.orient-lock #btnOrient{color:var(--accent);border-color:rgba(255,210,74,.45);background:var(--accent-dim)}
+/* 全屏按钮在「全屏中」也是亮的：横屏里右上角那排就是退出入口，不能只有
+   点下去才有反应，否则用户找不到怎么退出来 */
+.icon-btn.on{color:var(--accent)}
 
 /* ---------- 取景器 ---------- */
 .stage-wrap{
@@ -906,18 +909,20 @@ body.q270 #app{
   transform:rotate(-90deg) translateX(-100%);
 }
 
-/* 全屏取景：顶栏、工具条、快门全部变成浮层压在画面上，取景吃满整屏。
-   竖屏横屏都套这一套 —— 非全屏时这些元素仍然各占一行，不浮层。 */
-body.full #app{position:fixed;inset:0;overflow:hidden;padding-top:0}
-/* 画面就是整块屏幕：取景容器铺满，顶栏/工具条/快门全是浮层。
+/* ---------- 沉浸式：全屏 / 横屏 ----------
+   竖屏非全屏是「顶栏 → 取景框 → 工具条 → 快门」四行竖排，各占一行；
+   全屏和横屏改成沉浸式：取景铺满可用区域，控件全部脱离文档流浮在画面上。
+   横屏再进一步 —— 控件落在画面左右两条栏里（见下面的 .land 段）。 */
+body.immersive #app{position:fixed;inset:0;overflow:hidden;padding-top:0}
+/* 画面就是整块可用区域：取景容器铺满，顶栏/工具条/快门全是浮层。
    以前这里只写了 padding:0，容器仍是文档流里的 flex 子项，
    旋转后拿到的可用高度是旧值，取景框就被压成一条横带。 */
-body.full .stage-wrap{
+body.immersive .stage-wrap{
   position:absolute;inset:0;padding:0;
   display:flex;align-items:center;justify-content:center;
 }
-body.full .stage-col{gap:0;position:absolute;inset:0;width:auto;height:auto}
-body.full .stage{border-radius:0;max-width:none;max-height:none}
+body.immersive .stage-col{gap:0;position:absolute;inset:0;width:auto;height:auto}
+body.immersive .stage{border-radius:0;max-width:none;max-height:none}
 
 /* 全屏时的退出按钮：浮在右上角，跟着 #app 一起转，方向永远是对的。
    无底色 —— 和其它控件一样纯图标浮在画面上，靠投影勾边。 */
@@ -935,36 +940,19 @@ body.full .stage{border-radius:0;max-width:none;max-height:none}
 body.full #btnExitFull{display:flex}
 #btnExitFull:active{background:rgba(255,255,255,.14)}
 
-/* 底部不再铺那条黑到透明的渐变 —— 全屏取景时它会压出一道色带，
-   快门和相册按钮直接浮在画面上就好。 */
-body.full .controls{
+/* 沉浸式下底部那排（图库 / 快门 / 定位）不再占一行高度，直接浮起来。
+   竖屏全屏仍然是一条贴底的横排；横屏的整体布局在下面 .land 段里重排。 */
+body.immersive .controls{
   position:absolute;left:0;right:0;bottom:0;
   padding:8px 0 calc(6px + var(--safe-b));
   background:none;
   pointer-events:none;
   gap:40px;
 }
-body.full .controls>*{pointer-events:auto}
+body.immersive .controls>*{pointer-events:auto}
 
-/* 横屏：组件一个都不搬。
-   以前这里把工具条 absolute 到画面左上、黑边够宽时还竖排搬进左侧黑边，
-   结果就是「横过来整套界面换了位置」。现在维持和竖屏完全相同的结构
-   （顶栏 → 取景框 → 工具条 → 快门），旋转只改两件事：
-     · 取景框比例从 3:4 变成 4:3（同一张框转 90°）；
-     · 水印按旋转方向落到同一个逻辑角（左下还是左下）。
-   横屏纵向空间本来就紧，所以只把上下留白压掉，把高度还给画面 ——
-   位置不动，尺寸不变。 */
-body.land .topbar{padding:4px 12px 0}
-body.land .stage-wrap{padding:2px 12px}
-body.land .stage-col{gap:6px}
-body.land .bars{gap:5px}
-body.land .controls{padding:0 24px calc(4px + var(--safe-b))}
-/* 快门只缩一圈（不动位置），把省下的高度全给画面 */
-body.land .shutter{width:64px;height:64px}
-body.land .shutter span{width:52px;height:52px}
-
-/* 全屏：顶栏浮在最上面，工具条就往下让出它的高度（竖屏、横屏同理） */
-body.full .bars{
+/* 沉浸式：顶栏浮在最上面，工具条就往下让出它的高度（竖屏全屏用） */
+body.immersive .bars{
   position:absolute;z-index:6;
   top:calc(52px + env(safe-area-inset-top, 0px));left:8px;right:auto;
   /* max-content + max-width：先按内容撑开，超宽了再靠 wrap 换行。
@@ -975,60 +963,157 @@ body.full .bars{
   flex-direction:row;flex-wrap:wrap;align-items:flex-start;gap:6px;
   padding:0;background:none;
 }
-body.land .toolbar{background:rgba(10,14,20,.46);padding:2px 5px;gap:2px}
-body.land .tool{padding:5px 8px;gap:0}
-body.land .tool span{display:none}
-body.land .style-btn{padding:5px 10px;font-size:12px;gap:5px}
-body.land .style-btn b{font-size:11px}
 
-body.full .topbar{
+body.immersive .topbar{
   position:absolute;top:0;left:0;right:auto;z-index:7;
   padding:6px 10px;gap:8px;
   background:none;
   pointer-events:none;
 }
-body.full .topbar>*{pointer-events:auto}
-/* 横屏不显示标题：转 90° 之后它会变成一竖行贴边文字，纯属干扰 */
-body.full .brand{display:none}
-body.full .level-wrap{width:min(42%,200px)}
+body.immersive .topbar>*{pointer-events:auto}
+/* 全屏不显示标题：顶栏只剩图标，画面才是主角 */
+body.immersive .brand{display:none}
+body.immersive .level-wrap{width:min(42%,200px)}
 
-/* ---------- 全屏：控件一律透明，图标直接浮在画面之上 ----------
+/* ---------- 沉浸式：控件一律透明，图标直接浮在画面之上 ----------
    以前顶栏、工具条、快门各带一块半透明底板或底部渐变，非全屏时它们在
-   文档流里各占一行还看不出来；一旦全屏，这些底板就变成压在取景画面上的
-   灰色块。全屏下全部去掉底色，靠投影让图标在任何画面上都看得清
+   文档流里各占一行还看不出来；一旦浮起来，这些底板就变成压在取景画面上的
+   灰色块。沉浸式下全部去掉底色，靠投影让图标在任何画面上都看得清
    （1px 深色投影勾边，比铺一块底板更不挡画面）。 */
-body.full .icon-btn,
-body.full .tool,
-body.full .ev,
-body.full .style-btn{
+body.immersive .icon-btn,
+body.immersive .tool,
+body.immersive .ev,
+body.immersive .style-btn{
   background:none;
   box-shadow:none;
   filter:drop-shadow(0 1px 2px rgba(0,0,0,.88)) drop-shadow(0 0 6px rgba(0,0,0,.42));
 }
-body.full .icon-btn{border-color:transparent}
+body.immersive .icon-btn{border-color:transparent}
 /* 工具胶囊只有文字，留一圈极淡白边让人知道哪里能点 */
-body.full .tool,
-body.full .ev,
-body.full .style-btn{border-color:rgba(255,255,255,.22)}
-/* 激活态（网格开、EV 非 0、样式名）保留琥珀实底 —— 全屏里这是唯一
+body.immersive .tool,
+body.immersive .ev,
+body.immersive .style-btn{border-color:rgba(255,255,255,.22)}
+/* 激活态（网格开、EV 非 0、样式名）保留琥珀实底 —— 这是唯一
    需要一眼看出来的状态，不能也透明掉 */
-body.full .tool.on,
-body.full .style-btn:active{
+body.immersive .tool.on,
+body.immersive .style-btn:active{
   background:var(--accent);
   border-color:var(--accent);
   color:#141414;
   filter:none;
 }
-body.full .tool.on b,
-body.full .style-btn:active b{color:#141414}
-body.full .toolbar{
+body.immersive .tool.on b,
+body.immersive .style-btn:active b{color:#141414}
+body.immersive .toolbar{
   background:none;padding:0;
   flex:0 1 auto;flex-wrap:wrap;overflow:visible;max-width:100%;
 }
 /* 快门白圈、相册/切换图标同理：亮场景里纯白会糊，给投影 */
-body.full .shutter,
-body.full .side-btn{
+body.immersive .shutter,
+body.immersive .side-btn{
   filter:drop-shadow(0 1px 3px rgba(0,0,0,.82)) drop-shadow(0 0 9px rgba(0,0,0,.45));
+}
+
+/* ================= 横屏 =================
+   横过来不是把竖屏那套竖排结构压扁，而是相机本来的样子：
+     · 画面占满整个高度，左右各留一条控件栏（画面按栏宽内缩，
+       所以水印永远不会被控件压住）；
+     · 左栏：设置那排图标在最上，工具条（补光 / 水平 / EV / 水印样式）
+       在它下面，图库在最下 —— 竖屏里在左上角的东西，横屏还在左上角；
+     · 右栏：快门居中，定位在最下。
+   两条栏的宽度写在 --rail-l / --rail-r 里，layoutStage 读 .stage-wrap
+   的 padding 来算可用宽度，改这里就够了。 */
+body.land{--rail-l:200px;--rail-r:112px}
+body.land .stage-wrap{
+  position:absolute;inset:0;
+  padding:0 calc(var(--rail-r) + env(safe-area-inset-right, 0px))
+          0 calc(var(--rail-l) + env(safe-area-inset-left, 0px));
+}
+/* 横屏时取景容器回到文档流，靠 .stage-wrap 的 padding 让出两条栏 */
+body.land .stage-col{position:static;width:100%;height:100%}
+body.land .stage{border-radius:0}
+/* 横屏全屏 = 画面连两条栏一起吃掉 */
+body.land.full .stage-wrap{padding:0}
+body.land.full .stage-col{position:absolute;inset:0;width:auto;height:auto}
+
+/* 左栏顶：设置 / 方向 / 切换 / 全屏，仍然从左往右排 */
+body.land .topbar{
+  position:absolute;z-index:7;
+  top:calc(8px + env(safe-area-inset-top, 0px));
+  left:calc(10px + env(safe-area-inset-left, 0px));
+  right:auto;
+  width:auto;
+  flex-wrap:nowrap;justify-content:flex-start;
+  gap:6px;padding:0;background:none;pointer-events:none;
+}
+body.land .topbar>*{pointer-events:auto}
+body.land .icon-btn{width:38px;height:38px;border-radius:11px}
+body.land .brand{display:none}
+
+/* 左栏：工具条一列，左对齐，让出顶栏那一行 */
+body.land .bars{
+  position:absolute;z-index:6;
+  top:calc(54px + env(safe-area-inset-top, 0px));
+  left:calc(10px + env(safe-area-inset-left, 0px));
+  right:auto;
+  width:calc(var(--rail-l) - 22px);
+  max-width:calc(var(--rail-l) - 22px);
+  flex-direction:column;align-items:flex-start;gap:8px;
+  padding:0;background:none;
+}
+body.land .toolbar{
+  flex-wrap:wrap;gap:6px;
+  background:none;padding:0;overflow:visible;max-width:100%;
+}
+body.land .tool{padding:6px 10px;gap:4px}
+body.land .stylebar{justify-content:flex-start}
+body.land .style-btn{padding:6px 11px;font-size:12px;gap:5px}
+body.land .style-btn b{font-size:11px}
+
+/* 快门挪到右栏正中间，图库 / 定位各自贴底角 */
+body.land .controls{
+  left:0;right:0;top:0;bottom:0;
+  padding:0;background:none;pointer-events:none;
+}
+body.land .controls>*{position:absolute;pointer-events:auto}
+body.land .shutter{
+  right:calc(28px + env(safe-area-inset-right, 0px));
+  top:calc(50% - 36px);
+  left:auto;bottom:auto;
+  width:72px;height:72px;
+}
+body.land .shutter span{width:58px;height:58px}
+body.land #btnGallery{
+  left:calc(14px + env(safe-area-inset-left, 0px));
+  bottom:calc(12px + env(safe-area-inset-bottom, 0px));
+  top:auto;right:auto;
+}
+body.land #btnRelocate{
+  right:calc(8px + env(safe-area-inset-right, 0px));
+  bottom:calc(12px + env(safe-area-inset-bottom, 0px));
+  top:auto;left:auto;
+}
+
+/* 小屏横着（老机型 640~760 CSS 宽）：两条栏收窄，控件跟着缩一号，
+   否则栏会吃掉半个屏幕，画面又变回一张小卡片。 */
+@media (max-width:760px){
+  body.land{--rail-l:176px;--rail-r:100px}
+  body.land .icon-btn{width:34px;height:34px;border-radius:10px}
+  body.land .topbar{gap:5px}
+  body.land .bars{top:calc(48px + env(safe-area-inset-top, 0px));width:calc(var(--rail-l) - 20px);max-width:calc(var(--rail-l) - 20px)}
+  body.land .tool{padding:5px 8px;gap:0}
+  body.land .tool span{display:none}
+  body.land .ev{padding:4px 8px;gap:5px}
+  body.land .ev input[type=range]{width:52px}
+  body.land .ev b{min-width:22px}
+  body.land .style-btn{padding:6px 9px;gap:4px;font-size:11.5px}
+  body.land .style-btn>span{display:none}
+  body.land .shutter{
+    width:64px;height:64px;
+    top:calc(50% - 32px);
+    right:calc(20px + env(safe-area-inset-right, 0px));
+  }
+  body.land .shutter span{width:52px;height:52px}
 }
 
 /* ---------- 横竖切换 / 进出全屏的过渡 ----------
