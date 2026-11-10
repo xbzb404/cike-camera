@@ -19,3 +19,6 @@ desktop.ini
 __pycache__/
 *.pyc
 node_modules/
+
+# 验证脚本的中间产物
+tools/_*

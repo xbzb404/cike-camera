@@ -1,25 +1,22 @@
+'use strict';
 /* ============================================================
-   影调（曝光）分析测试
+   影调引擎单测
    ------------------------------------------------------------
-   针对「拍出来发白」这条问题，验证三件事：
-     1. 高光溢出比例算得对（决定降几档）
-     2. 正常场景不要乱动（晴天天空本来就有高光）
-     3. takePhoto 比预览帧更白时要判定为「该换掉」
+   重点不是「参数改对了」，而是曲线的数学性质：
+   单调、端点归位、暗场不漂白、白平衡不误判。
    运行：node tests/test-tone.js
    ============================================================ */
-'use strict';
 
-const path = require('path');
 const assert = require('assert');
-const Tone = require(path.join(__dirname, '..', 'www', 'js', 'tone.js'));
+const Tone = require('../www/js/tone.js');
 
 let pass = 0, fail = 0;
 function ok(name, fn) {
-  try { fn(); console.log('  ✓ ' + name); pass++; }
-  catch (e) { console.log('  ✗ ' + name + '\n      ' + e.message); fail++; }
+  try { fn(); pass++; console.log('  ✓ ' + name); }
+  catch (e) { fail++; console.log('  ✗ ' + name + '\n      ' + e.message); }
 }
 
-/* 造一张 RGBA 图：rgb 为 [r,g,b]，count 为像素数 */
+/* 构造合成图：按 [{rgb,count}] 铺像素 */
 function img(spec) {
   let n = 0;
   for (const s of spec) n += s.count;
@@ -33,136 +30,147 @@ function img(spec) {
   return a;
 }
 
-const WHITE = [255, 255, 255];
 const GREY = [128, 128, 128];
-const BLACK = [0, 0, 0];
+const WHITE = [255, 255, 255];
+const DARK = [26, 26, 26];
 
-console.log('\n[1] 统计量');
-ok('全灰 mean≈128、无溢出', () => {
+console.log('\n[1] analyze 分位与高光白点');
+ok('中位与百分位算得对', () => {
   const s = Tone.analyze(img([{ rgb: GREY, count: 1000 }]), 1);
-  assert.ok(Math.abs(s.mean - 128) < 1, 'mean=' + s.mean);
-  assert.strictEqual(s.blown, 0);
-  assert.strictEqual(s.dark, 0);
+  assert.ok(Math.abs(s.p50 - 128 / 255) < 0.01, 'p50=' + s.p50);
+  assert.ok(Math.abs(s.p1 - 128 / 255) < 0.02, 'p1=' + s.p1);
 });
-ok('全白 blown=1', () => {
-  const s = Tone.analyze(img([{ rgb: WHITE, count: 500 }]), 1);
-  assert.strictEqual(s.blown, 1);
+ok('7% 纯白 → p99.5 触顶', () => {
+  const s = Tone.analyze(img([{ rgb: WHITE, count: 70 }, { rgb: [143, 143, 143], count: 930 }]), 1);
+  assert.ok(s.p995 > 0.98, 'p995=' + s.p995);
+  assert.ok(Math.abs(s.p50 - 143 / 255) < 0.01, 'p50=' + s.p50);
 });
-ok('全黑 dark=1', () => {
-  const s = Tone.analyze(img([{ rgb: BLACK, count: 500 }]), 1);
-  assert.strictEqual(s.dark, 1);
-});
-ok('抽样步长不改变结论', () => {
-  const a = img([{ rgb: WHITE, count: 300 }, { rgb: GREY, count: 700 }]);
-  const s1 = Tone.analyze(a, 1), s4 = Tone.analyze(a, 4);
-  assert.ok(Math.abs(s1.blown - s4.blown) < 0.02, s1.blown + ' vs ' + s4.blown);
+ok('高光区均值独立于全图均值', () => {
+  // 90% 深蓝 + 10% 白：全图均值偏蓝，但高光均值应接近中性
+  const s = Tone.analyze(img([
+    { rgb: [10, 20, 90], count: 900 }, { rgb: WHITE, count: 100 }
+  ]), 1);
+  assert.ok(s.mb > s.mr, '全图应偏蓝');
+  assert.ok(Math.abs(s.hr - s.hg) < 12 && Math.abs(s.hg - s.hb) < 12,
+    '高光应中性: ' + [s.hr, s.hg, s.hb].map(Math.round).join('/'));
 });
 ok('空数据不炸', () => {
   const s = Tone.analyze(new Uint8ClampedArray(0), 1);
   assert.strictEqual(s.n, 0);
-  assert.strictEqual(Tone.brightnessFor(s), 1);
 });
 
-console.log('\n[2] 亮度建议');
-ok('严重发白（30% 溢出）压到 0.80', () => {
-  const s = Tone.analyze(img([{ rgb: WHITE, count: 300 }, { rgb: [200, 200, 200], count: 700 }]), 1);
-  assert.ok(s.blown > 0.28, 'blown=' + s.blown);
-  assert.strictEqual(Tone.brightnessFor(s), 0.80);
+console.log('\n[2] 曲线单调性（非单调会撕裂）');
+ok('三条通道曲线都严格不下降', () => {
+  const cases = [
+    [{ rgb: [143, 143, 143], count: 900 }, { rgb: WHITE, count: 100 }],
+    [{ rgb: DARK, count: 1000 }],
+    [{ rgb: [90, 100, 120], count: 1000 }]
+  ];
+  for (const c of cases) {
+    const lut = Tone.buildLut(Tone.analyze(img(c), 1), {});
+    for (const ch of ['r', 'g', 'b']) {
+      for (let v = 1; v < 256; v++) {
+        assert.ok(lut[ch][v] >= lut[ch][v - 1],
+          ch + '[' + v + ']=' + lut[ch][v] + ' < ' + lut[ch][v - 1]);
+      }
+    }
+  }
 });
-ok('明显发白（18% 溢出 + 均值偏高）压到 0.80', () => {
-  const s = Tone.analyze(img([{ rgb: WHITE, count: 180 }, { rgb: [200, 200, 200], count: 820 }]), 1);
-  assert.strictEqual(Tone.brightnessFor(s), 0.80);
-});
-ok('中等发白（12% 溢出）压到 0.88', () => {
-  const s = Tone.analyze(img([{ rgb: WHITE, count: 120 }, { rgb: [150, 150, 150], count: 880 }]), 1);
-  assert.strictEqual(Tone.brightnessFor(s), 0.88);
-});
-ok('整体偏亮但没溢出 → 0.92', () => {
-  const s = Tone.analyze(img([{ rgb: [210, 210, 210], count: 1000 }]), 1);
-  assert.strictEqual(Tone.brightnessFor(s), 0.92);
-});
-ok('正常晴天（少量高光、均值 140）不动', () => {
-  const s = Tone.analyze(img([{ rgb: WHITE, count: 50 }, { rgb: [137, 137, 137], count: 950 }]), 1);
-  assert.ok(s.blown < 0.06, 'blown=' + s.blown);
-  assert.strictEqual(Tone.brightnessFor(s), 1);
-});
-ok('偏暗夜景提亮到 1.08', () => {
-  const s = Tone.analyze(img([{ rgb: [30, 30, 30], count: 1000 }]), 1);
-  assert.strictEqual(Tone.brightnessFor(s), 1.08);
-});
-ok('压暗时补对比度', () => {
-  assert.strictEqual(Tone.contrastFor(1), 1);
-  assert.ok(Tone.contrastFor(0.8) > 1.1, 'contrast=' + Tone.contrastFor(0.8));
+ok('黑端归零、白端触顶', () => {
+  const lut = Tone.buildLut(Tone.analyze(img([
+    { rgb: [30, 30, 30], count: 10 }, { rgb: GREY, count: 900 }, { rgb: [240, 240, 240], count: 90 }
+  ]), 1), {});
+  assert.ok(lut.r[0] <= 3, 'LUT[0]=' + lut.r[0]);
+  assert.strictEqual(lut.r[255], 255);
 });
 
-console.log('\n[3] takePhoto 偏亮判定');
-ok('原生图 30% 溢出、预览帧 5% → 换掉', () => {
-  const photo = Tone.analyze(img([{ rgb: WHITE, count: 300 }, { rgb: [190, 190, 190], count: 700 }]), 1);
-  const frame = Tone.analyze(img([{ rgb: WHITE, count: 50 }, { rgb: [120, 120, 120], count: 950 }]), 1);
-  assert.strictEqual(Tone.shouldReplacePhoto(photo, frame), true);
+console.log('\n[3] 对比度与亮度行为');
+ok('低对比画面 → 动态范围被拉开', () => {
+  // 模拟实测那张图：像素挤在 69~144
+  const s = Tone.analyze(img([
+    { rgb: [69, 69, 69], count: 250 },
+    { rgb: [111, 111, 111], count: 500 },
+    { rgb: [144, 144, 144], count: 240 },
+    { rgb: [250, 250, 250], count: 10 }
+  ]), 1);
+  const lut = Tone.buildLut(s, {});
+  const before = 144 - 69;
+  const after = lut.r[144] - lut.r[69];
+  assert.ok(after > before * 1.4, '拉伸后 ' + after + ' 应远大于 ' + before);
 });
-ok('两者都正常 → 不动', () => {
-  const photo = Tone.analyze(img([{ rgb: [130, 130, 130], count: 1000 }]), 1);
-  const frame = Tone.analyze(img([{ rgb: [128, 128, 128], count: 1000 }]), 1);
-  assert.strictEqual(Tone.shouldReplacePhoto(photo, frame), false);
+ok('中位锚定到 0.46 附近', () => {
+  const s = Tone.analyze(img([{ rgb: [110, 110, 110], count: 1000 }]), 1);
+  const lut = Tone.buildLut(s, {});
+  assert.ok(Math.abs(lut.r[110] - 118) < 20, 'LUT[110]=' + lut.r[110]);
 });
-ok('原生图只是略亮（3%）→ 不值得牺牲分辨率', () => {
-  const photo = Tone.analyze(img([{ rgb: WHITE, count: 60 }, { rgb: [140, 140, 140], count: 940 }]), 1);
-  const frame = Tone.analyze(img([{ rgb: WHITE, count: 10 }, { rgb: [138, 138, 138], count: 990 }]), 1);
-  assert.strictEqual(Tone.shouldReplacePhoto(photo, frame), false);
+ok('暗场景不被漂白', () => {
+  const s = Tone.analyze(img([{ rgb: [18, 18, 18], count: 950 }, { rgb: [60, 60, 60], count: 50 }]), 1);
+  const lut = Tone.buildLut(s, {});
+  assert.ok(lut.r[18] < 70, '暗部被抬到 ' + lut.r[18] + '，太亮');
 });
-ok('预览帧缺失时不换', () => {
-  const photo = Tone.analyze(img([{ rgb: WHITE, count: 500 }, { rgb: GREY, count: 500 }]), 1);
-  assert.strictEqual(Tone.shouldReplacePhoto(photo, null), false);
+ok('手动曝光向左压暗', () => {
+  const s = Tone.analyze(img([{ rgb: GREY, count: 1000 }]), 1);
+  const a = Tone.buildLut(s, { exposure: 0 });
+  const b = Tone.buildLut(s, { exposure: -0.3 });
+  assert.ok(b.r[128] < a.r[128], b.r[128] + ' 应小于 ' + a.r[128]);
 });
-
-console.log('\n[4] 防抖与 filter 字符串');
-ok('差异小于 3.5% 不更新预览', () => {
-  assert.strictEqual(Tone.shouldUpdate(1, 1.02), false);
-  assert.strictEqual(Tone.shouldUpdate(1, 0.88), true);
-  assert.strictEqual(Tone.shouldUpdate(null, 0.9), true);
-});
-ok('无修正时返回 none', () => {
-  assert.strictEqual(Tone.cssFilter(1, 1), 'none');
-  assert.strictEqual(Tone.cssFilter(1.001, 1.002), 'none');
-});
-ok('有修正时生成合法 CSS', () => {
-  const f = Tone.cssFilter(0.8, 1.18);
-  assert.ok(/^brightness\(0\.800\) contrast\(1\.180\)$/.test(f), f);
-});
-ok('参数越界被夹住', () => {
-  const f = Tone.cssFilter(0.01, 9);
-  assert.ok(/brightness\(0\.500\) contrast\(1\.500\)/.test(f), f);
+ok('手动曝光向右提亮', () => {
+  const s = Tone.analyze(img([{ rgb: GREY, count: 1000 }]), 1);
+  const a = Tone.buildLut(s, { exposure: 0 });
+  const b = Tone.buildLut(s, { exposure: 0.3 });
+  assert.ok(b.r[128] > a.r[128], b.r[128] + ' 应大于 ' + a.r[128]);
 });
 
-console.log('\n[5] 百分位与高光保护');
-ok('百分位算得对（7% 纯白 → p995 = 1）', () => {
-  const st = Tone.analyze(img([{ rgb: WHITE, count: 70 }, { rgb: [143, 143, 143], count: 930 }]), 1);
-  assert.ok(st.p995 > 0.98, 'p995=' + st.p995);
-  assert.ok(Math.abs(st.p50 - 143 / 255) < 0.01, 'p50=' + st.p50);
+console.log('\n[4] 白平衡（白点法）');
+ok('大面积单色场景不被误校正', () => {
+  // 全画幅青色物体 + 少量中性高光：灰世界会把青色洗掉，白点法不会
+  const s = Tone.analyze(img([
+    { rgb: [40, 120, 140], count: 900 },
+    { rgb: [235, 235, 235], count: 100 }
+  ]), 1);
+  const g = Tone.grayGains(s);
+  assert.ok(Math.abs(g.r - 1) < 0.06 && Math.abs(g.b - 1) < 0.06,
+    '不该动: ' + JSON.stringify(g));
 });
-ok('全灰 p50 ≈ 0.5', () => {
-  const st = Tone.analyze(img([{ rgb: GREY, count: 1000 }]), 1);
-  assert.ok(Math.abs(st.p50 - 128 / 255) < 0.01);
+ok('偏黄光源被纠正', () => {
+  const s = Object.assign({}, Tone.analyze(img([{ rgb: GREY, count: 10 }]), 1),
+    { hr: 250, hg: 235, hb: 180 });
+  const g = Tone.grayGains(s);
+  assert.ok(g.r < 0.98, 'R 应被压: ' + g.r);
+  assert.ok(g.b > 1.02, 'B 应被抬: ' + g.b);
 });
-ok('轻微溢出但有饱和高光 → 高光保护压到 0.95', () => {
-  const st = Tone.analyze(img([{ rgb: WHITE, count: 70 }, { rgb: [143, 143, 143], count: 930 }]), 1);
-  assert.strictEqual(Tone.tierFor(st), 1);
-  assert.strictEqual(Tone.highlightGuard(st), 0.95);
-  assert.strictEqual(Tone.brightnessFor(st), 0.95);
+ok('高光不够亮时不动白平衡', () => {
+  const s = Tone.analyze(img([{ rgb: [30, 40, 60], count: 1000 }]), 1);
+  const g = Tone.grayGains(s);
+  assert.strictEqual(g.r, 1); assert.strictEqual(g.g, 1); assert.strictEqual(g.b, 1);
 });
-ok('晴天 5% 高光不触发保护', () => {
-  const st = Tone.analyze(img([{ rgb: WHITE, count: 50 }, { rgb: [137, 137, 137], count: 950 }]), 1);
-  assert.strictEqual(Tone.highlightGuard(st), 1);
-  assert.strictEqual(Tone.brightnessFor(st), 1);
+
+console.log('\n[5] 取图路径判定');
+ok('轻微过曝不弃用原生图', () => {
+  assert.strictEqual(Tone.shouldReplacePhoto(
+    { n: 1000, blown: 0.12, mean: 180 }, { n: 1000, blown: 0.04, mean: 150 }), false);
 });
-ok('提亮场景不被保护压回 1', () => {
-  const st = Tone.analyze(img([{ rgb: [30, 30, 30], count: 1000 }]), 1);
-  assert.strictEqual(Tone.brightnessFor(st), 1.08);
+ok('严重死白才弃用', () => {
+  assert.strictEqual(Tone.shouldReplacePhoto(
+    { n: 1000, blown: 0.62, mean: 245 }, { n: 1000, blown: 0.10, mean: 170 }), true);
 });
-ok('保护有下限，不会压到 0.72 以下', () => {
-  const st = Tone.analyze(img([{ rgb: WHITE, count: 1000 }]), 1);
-  assert.ok(Tone.highlightGuard(st) >= 0.72 - 1e-9, String(Tone.highlightGuard(st)));
+ok('均值极高且差距大才换', () => {
+  assert.strictEqual(Tone.shouldReplacePhoto(
+    { n: 1000, blown: 0.20, mean: 240 }, { n: 1000, blown: 0.10, mean: 180 }), true);
+});
+ok('数据不全时不换', () => {
+  assert.strictEqual(Tone.shouldReplacePhoto(null, { n: 1 }), false);
+  assert.strictEqual(Tone.shouldReplacePhoto({ n: 1 }, null), false);
+});
+
+console.log('\n[6] 预览近似');
+ok('LUT 存在时 previewFilter 不返回 none', () => {
+  const s = Tone.analyze(img([{ rgb: [143, 143, 143], count: 900 }, { rgb: WHITE, count: 100 }]), 1);
+  const f = Tone.previewFilter(Tone.buildLut(s, {}));
+  assert.ok(f !== 'none' && /contrast\(/.test(f), f);
+});
+ok('null 输入返回 none', () => {
+  assert.strictEqual(Tone.previewFilter(null), 'none');
 });
 
 console.log('\n通过 ' + pass + ' / ' + (pass + fail));

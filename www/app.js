@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.3.3';
+const APP_VERSION = '1.4.0';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -52,9 +52,7 @@ const DEFAULTS = {
   smartPick: true,
   writeExif: true,
   jpegQuality: 0.94,
-  grid: false,
-  level: true,
-  timer: 0,             // 0 | 3 | 10
+  level: false,         // 水平仪（默认关，需要时点开）
   ev: 0,                // 硬件曝光补偿（不是所有机型都支持）
   autoTone: true,       // 自动压高光：成片发白时按亮度分析降一档
   bright: 0             // 手动亮度补偿，-30 ~ +30（百分比）
@@ -181,6 +179,8 @@ async function startCamera(deviceId, opts) {
     const track = stream.getVideoTracks()[0];
     trackRef = track;
     const st = (track.getSettings && track.getSettings()) || {};
+    devDiag.stream = (st.width || 0) + 'x' + (st.height || 0) +
+      (st.focalLengthX ? ' ' + Math.round(st.focalLengthX) + 'mm' : '');
     curDeviceId = st.deviceId || deviceId || null;
     if (st.facingMode) facing = st.facingMode;
     caps = (track.getCapabilities && track.getCapabilities()) || {};
@@ -195,8 +195,7 @@ async function startCamera(deviceId, opts) {
     startToneLoop();
     applyEv(S.ev);
 
-    if (!keepLenses) await scanLenses(track);
-    else renderLensBar();
+    await setupZoom(track);
 
     updateToolCaps();
     return true;
@@ -236,103 +235,49 @@ function focalToLabel(ratio) {
   return (best % 1 === 0 ? best : best.toFixed(1)) + '×';
 }
 
-async function probeCamera(deviceId) {
-  let s = null;
-  try {
-    s = await navigator.mediaDevices.getUserMedia({ audio: false, video: { deviceId: { exact: deviceId } } });
-    const t = s.getVideoTracks()[0];
-    const c = (t.getCapabilities && t.getCapabilities()) || {};
-    const st = (t.getSettings && t.getSettings()) || {};
-    return { focal: c.focalLengthX || st.focalLengthX || 0, facing: st.facingMode || null };
-  } catch (e) {
-    return null;
-  } finally {
-    if (s) s.getTracks().forEach(x => x.stop());
-  }
-}
+/* 变焦：只走传感器的 zoom 能力。
+   ------------------------------------------------------------
+   旧实现有两处问题，都被反馈过：
+   1) 「多摄探测」会对每个后置摄像头各开一次流、读能力、再关掉，
+      4 摄机型要开合 4 次，每次几百毫秒，画面还会闪 —— 这是卡顿的主因之一。
+   2) 拿不到 zoom 能力时用「裁切」冒充变焦。裁切只是把中心区域放大，
+      分辨率本来就低（4.9MP 的视频流），再裁就是雪上加霜，越拉越糊。
+      用户要的是「调用机器本身摄像头」，不是数字变焦。
 
-async function scanLenses(track) {
+   所以这里只保留真实 zoom；设备不给能力就不显示变焦入口。 */
+async function setupZoom(track) {
   lensList = [];
-  lensIndex = 0;
   lensMode = 'none';
+  lensIndex = 0;
   zoom = { type: 'none', v: 1 };
   applyVideoTransform();
   renderLensBar();
   if (!track) return;
 
   const c = (track.getCapabilities && track.getCapabilities()) || {};
-  const sets = (track.getSettings && track.getSettings()) || {};
+  const cz = c.zoom;
+  const lo = (cz && cz.min) || 1;
 
-  let cams = [];
-  try {
-    cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput' && d.deviceId);
-  } catch (e) { cams = []; }
-
-  let same = cams.filter(d => facingOfDevice(d) === facing);
-  if (!same.length) {
-    const cur = cams.find(d => d.deviceId === curDeviceId);
-    same = cur ? [cur] : [];
+  // 打开后先把 zoom 归位。部分机型默认不是 1×，视野会莫名变窄。
+  if (cz && track.applyConstraints) {
+    try { await track.applyConstraints({ advanced: [{ zoom: lo }] }); } catch (e) {}
   }
+  if (!cz || !(cz.max > lo)) return;         // 没有硬件变焦能力，直接不给入口
 
-  // ① 同朝向多摄 → 物理镜头切换
-  if (same.length >= 2) {
-    const backup = curDeviceId;
-    const ownFocal = c.focalLengthX || sets.focalLengthX || 0;
-    stopStream();
-    const list = [];
-    for (const d of same) {
-      if (d.deviceId === backup && ownFocal) { list.push({ deviceId: d.deviceId, focal: ownFocal }); continue; }
-      const r = await probeCamera(d.deviceId);
-      if (!r) continue;
-      if (r.facing && r.facing !== facing) continue;
-      list.push({ deviceId: d.deviceId, focal: r.focal });
-    }
-    const reopened = await startCamera(backup, { keepLenses: true });
+  const max = Math.min(cz.max, 8);
+  const steps = [1, 2, 3, 5]
+    .map(z => Math.max(lo, z))
+    .filter((z, i, a) => z <= max + 0.01 && a.indexOf(z) === i);
+  if (steps.length < 2) return;
 
-    if (list.length >= 2 && reopened) {
-      if (list.every(x => x.focal > 0)) {
-        const asc = list.map(x => x.focal).sort((a, b) => a - b);
-        const base = asc[Math.floor(asc.length / 2)];
-        list.sort((a, b) => a.focal - b.focal);
-        lensList = list.map((x, i) => ({ key: 'dev' + i, label: focalToLabel(x.focal / base), deviceId: x.deviceId, zoom: null }));
-      } else {
-        lensList = list.map((x, i) => ({ key: 'dev' + i, label: (i + 1) + '×', deviceId: x.deviceId, zoom: null }));
-      }
-      const used = {};
-      lensList.forEach(l => {
-        if (used[l.label]) l.label = (parseFloat(l.label) + 0.5).toFixed(1) + '×';
-        used[l.label] = 1;
-      });
-      lensMode = 'optical';
-      const found = lensList.findIndex(l => l.deviceId === curDeviceId);
-      lensIndex = found >= 0 ? found : 0;
-      renderLensBar();
-      return;
-    }
-    if (!reopened) return;
-  }
-
-  // ② 传感器缩放
-  const zmax = (c.zoom && c.zoom.max) || 0;
-  if (zmax >= 1.9) {
-    const max = Math.min(zmax, 8);
-    const steps = [1, 2, 3, 5].filter(z => z <= max + 0.01);
-    if (steps.length >= 2) {
-      lensMode = 'zoom';
-      lensList = steps.map(z => ({ key: 'zoom' + z, label: z + '×', deviceId: null, zoom: z }));
-      lensIndex = 0;
-      renderLensBar();
-      return;
-    }
-  }
-
-  // ③ 画面裁切兜底
-  if (facing === 'environment' && (video.videoWidth || 0) >= 1280) {
-    lensMode = 'crop';
-    lensList = [1, 2, 3].map(z => ({ key: 'crop' + z, label: z + '×', deviceId: null, zoom: null, crop: z }));
-    lensIndex = 0;
-    renderLensBar();
-  }
+  lensMode = 'zoom';
+  lensList = steps.map(z => ({
+    key: 'z' + z,
+    label: (z / lo).toFixed(Math.abs(z / lo - Math.round(z / lo)) < 0.05 ? 0 : 1) + '×',
+    zoom: z
+  }));
+  lensIndex = 0;
+  renderLensBar();
 }
 
 function renderLensBar() {
@@ -349,50 +294,31 @@ function renderLensBar() {
   ).join('');
 }
 
-function cropFallback(target) {
-  lensMode = 'crop';
-  lensList = [1, 2, 3].map(z => ({ key: 'crop' + z, label: z + '×', deviceId: null, zoom: null, crop: z }));
-  const i = lensList.findIndex(l => l.crop === target);
-  lensIndex = i >= 0 ? i : 0;
-  zoom = { type: 'crop', v: lensList[lensIndex].crop };
-  applyVideoTransform();
-  renderLensBar();
-}
-
 async function setLens(i) {
   if (!lensList[i] || i === lensIndex) return;
   const l = lensList[i];
   const prev = lensIndex;
-  lensIndex = i;
-  renderLensBar();
+  const prevZoom = zoom;
 
-  if (l.crop != null) {
-    zoom = { type: 'crop', v: l.crop };
+  if (l.zoom == null) return;
+  const t = trackRef;
+  try {
+    if (!t) throw new Error('no track');
+    await t.applyConstraints({ advanced: [{ zoom: l.zoom }] });
+    const got = (t.getSettings && t.getSettings().zoom);
+    // 有些机型会"接受"约束但不真正执行，读回来对不上就不认
+    if (got == null || Math.abs(got - l.zoom) > 0.05) throw new Error('ignored');
+    lensIndex = i;
+    zoom = { type: 'sensor', v: got };
     applyVideoTransform();
-    return;
-  }
-
-  if (l.zoom != null) {
-    const t = trackRef;
-    try {
-      if (!t) throw new Error('no track');
-      await t.applyConstraints({ advanced: [{ zoom: l.zoom }] });
-      const got = (t.getSettings && t.getSettings().zoom);
-      if (got == null || Math.abs(got - l.zoom) > 0.02) throw new Error('zoom-ignored');
-      zoom = { type: 'sensor', v: got || l.zoom };
-      applyVideoTransform();
-    } catch (e) {
-      cropFallback(Math.min(3, Math.max(2, Math.round(l.zoom))));
-      toast('已切换为数码变焦');
-    }
-    return;
-  }
-
-  const ok = await startCamera(l.deviceId, { keepLenses: true });
-  if (!ok) {
-    lensIndex = prev;
     renderLensBar();
-    toast('切换镜头失败');
+  } catch (e) {
+    // 不回退到裁切：宁可维持原倍率，也不要拿糊图冒充变焦
+    lensIndex = prev;
+    zoom = prevZoom;
+    applyVideoTransform();
+    renderLensBar();
+    toast('这台设备的相机不支持该倍率');
   }
 }
 
@@ -425,20 +351,18 @@ stage.addEventListener('touchend', () => { pinchStart = 0; }, { passive: true })
 async function applyZoom(z) {
   const t = trackRef;
   const cz = caps.zoom;
-  if (cz && t && z >= 1) {
-    try {
-      await t.applyConstraints({ advanced: [{ zoom: Math.min(cz.max, Math.max(cz.min, z)) }] });
-      const got = t.getSettings().zoom;
-      if (got != null) {
-        zoom = { type: 'sensor', v: got };
-        applyVideoTransform();
-        return;
-      }
-    } catch (e) {}
+  if (!cz || !t) return false;
+  const want = Math.min(cz.max, Math.max(cz.min || 1, z));
+  try {
+    await t.applyConstraints({ advanced: [{ zoom: want }] });
+    const got = t.getSettings().zoom;
+    if (got == null) return false;
+    zoom = { type: 'sensor', v: got };
+    applyVideoTransform();
+    return true;
+  } catch (e) {
+    return false;
   }
-  zoom = { type: 'crop', v: z };
-  lensMode = 'crop';
-  applyVideoTransform();
 }
 
 /* ---------- 触控对焦 ---------- */
@@ -509,12 +433,19 @@ function updateToolCaps() {
 /* ============================================================
    取景排版 / 实时水印
    ============================================================ */
+/* 横屏判定：短边小于 620 视为手机横放（平板横屏仍按竖排走，空间够） */
+function isLandscape() {
+  return window.innerWidth > window.innerHeight && window.innerHeight < 620;
+}
+
 function layoutStage() {
   const cs = getComputedStyle(stageWrap);
   const availW = stageWrap.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
   let availH = stageWrap.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+  // 横屏时工具条浮在画面上，不再占用文档流高度
+  const land = isLandscape();
   const bar = $('.bars');
-  if (bar) availH -= bar.offsetHeight + 10;
+  if (bar && !land) availH -= bar.offsetHeight + 10;
   if (availW <= 0 || availH <= 0) return;
 
   const vw = video.videoWidth || 1080;
@@ -584,7 +515,11 @@ function sampleVideoInk(pos) {
                                          → 与同一时刻预览帧比高光溢出比例，明显更白就换成预览帧；
      ③ 场景本身过曝                     → 按高光溢出比例压一档亮度并补对比度。
    压暗用 canvas ctx.filter（GPU 合成），作用在水印绘制与签名之前，不影响验真。 */
-let tone = { b: 1, c: 1 };
+let tone = { lut: null, preview: 'none', key: '' };
+
+/* 取图路径诊断：装机后能直接在设置里看到这次到底走了哪条路，
+   不用连电脑抓 console。字段刻意短，方便截图反馈。 */
+const devDiag = { stream: '', via: '', raw: '', out: '', tone: null };
 let toneTimer = 0;
 let toneCanvas = null;
 
@@ -593,7 +528,7 @@ function statsOf(src) {
   const w = src.videoWidth || src.width || 0;
   const h = src.videoHeight || src.height || 0;
   if (!w || !h) return null;
-  const TW = 160;
+  const TW = 192;
   const th = Math.max(1, Math.round(TW * h / w));
   if (!toneCanvas) toneCanvas = document.createElement('canvas');
   if (toneCanvas.width !== TW || toneCanvas.height !== th) {
@@ -603,38 +538,147 @@ function statsOf(src) {
   const c = toneCanvas.getContext('2d', { willReadFrequently: true });
   try {
     c.drawImage(src, 0, 0, TW, th);
-    return WMCTone.analyze(c.getImageData(0, 0, TW, th).data, 3);
+    return WMCTone.analyze(c.getImageData(0, 0, TW, th).data, 2);
   } catch (e) {
     return null;
   }
 }
 
-function manualBright() { return 1 + (Number(S.bright) || 0) / 100; }
+/* 手动亮度滑块 -30..+30 → 曝光补偿 -0.3..+0.3 档 */
+function manualExposure() {
+  return Math.max(-1, Math.min(1, (Number(S.bright) || 0) / 100));
+}
 
+function toneActive() {
+  return !!(window.WMCTone && (S.autoTone || Math.abs(manualExposure()) > 0.005));
+}
+
+/* 取景预览：CSS filter 只能近似「去灰」那一段，做不了查表。
+   这里刻意不做全局压暗 —— 那正是之前把画面压成灰雾的原因。 */
 function toneFilter() {
-  if (!window.WMCTone) return 'none';
-  return WMCTone.cssFilter(tone.b * manualBright(), tone.c);
+  return tone.preview || 'none';
 }
 
 function applyToneToPreview() {
   video.style.filter = toneFilter();
 }
 
-/* 从取景器采样，决定当前亮度系数；变化足够大才更新，避免忽明忽暗 */
+/* 从取景器采样，按分位生成查找表；变化足够大才更新，避免忽明忽暗 */
 function refreshTone(force) {
   if (!window.WMCTone || !video.videoWidth) return;
   const s = statsOf(video);
   if (!s) return;
-  const b = S.autoTone ? WMCTone.brightnessFor(s) : 1;
-  if (!force && !WMCTone.shouldUpdate(tone.b, b)) return;
-  tone = { b, c: WMCTone.contrastFor(b) };
+  const exp = manualExposure();
+  const key = (S.autoTone ? '1' : '0') + exp.toFixed(2) + s.p1.toFixed(3) + '|' + s.p995.toFixed(3);
+  if (!force && key === tone.key) return;
+  const lut = toneActive() ? WMCTone.buildLut(s, { exposure: exp, wb: !!S.autoTone }) : null;
+  tone = { lut, preview: WMCTone.previewFilter(lut), key };
   applyToneToPreview();
+}
+
+/* 成片：把 LUT 真正钉到像素上。发生在水印绘制与签名之前，不影响验真。
+   整个包在 try 里：个别 WebView 上 getImageData 会抛（画布被标记污染），
+   那种情况宁可输出原图，也不能让整次拍摄失败。 */
+function applyToneLut(canvas) {
+  if (!toneActive()) return canvas;
+  try {
+    const s = statsOf(canvas);
+    if (!s) return canvas;
+    const lut = WMCTone.buildLut(s, { exposure: manualExposure(), wb: !!S.autoTone });
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    WMCTone.applyLut(img.data, lut);
+    ctx.putImageData(img, 0, 0);
+    devDiag.tone = {
+      black: Math.round(lut.black), white: Math.round(lut.white),
+      gamma: +(lut.gamma || 1).toFixed(2),
+      wb: [lut.gains.r, lut.gains.g, lut.gains.b].map(v => +v.toFixed(2))
+    };
+  } catch (e) {
+    devDiag.tone = 'error: ' + (e && e.message ? e.message : e);
+  }
+  return canvas;
+}
+
+/* ---------- 水平仪 ----------
+   旧版只读 gamma，那只在竖屏成立。横屏时手机的「左右」对应 beta，
+   所以一转屏就彻底失准 —— 这就是「不会自适应横屏」。
+   这里按 screen.orientation.angle 选轴，并对角度做一阶低通平滑，
+   避免手抖时数字乱跳。 */
+let levelRoll = 0;
+let levelBound = false;
+
+function levelAngle(e) {
+  const ang = (screen.orientation && typeof screen.orientation.angle === 'number')
+    ? screen.orientation.angle
+    : (typeof window.orientation === 'number' ? window.orientation : 0);
+  const g = e.gamma, b = e.beta;
+  // 归一化到 0/90/180/270
+  const a = ((ang % 360) + 360) % 360;
+  if (a === 90) return b;            // 手机顺时针横放：左右倾斜走 beta
+  if (a === 270) return -b;
+  if (a === 180) return -g;          // 倒置
+  return g;                          // 竖屏
+}
+
+function initLevel() {
+  if (levelBound) return;
+  const wrap = document.getElementById('levelWrap');
+  const line = document.getElementById('levelLine');
+  const degEl = document.getElementById('levelDeg');
+  if (!wrap || !line) return;
+
+  const onOrient = (e) => {
+    if (!S.level) return;
+    let roll = levelAngle(e);
+    if (roll == null || !isFinite(roll)) return;
+    // beta/gamma 在接近 ±90 时是奇异点，钳到 ±60 免得乱转
+    roll = Math.max(-60, Math.min(60, roll));
+    // 一阶低通，α=0.35：跟手，又不抖
+    levelRoll = levelRoll * 0.65 + roll * 0.35;
+    const abs = Math.abs(levelRoll);
+    line.style.transform = 'rotate(' + (-levelRoll).toFixed(2) + 'deg)';
+    if (degEl) degEl.textContent = abs.toFixed(1) + '°';
+    wrap.classList.toggle('ok', abs < 1.0);
+  };
+
+  window.addEventListener('deviceorientation', onOrient, true);
+  levelBound = true;
+}
+
+function applyLevel() {
+  const wrap = document.getElementById('levelWrap');
+  if (wrap) wrap.hidden = !S.level;
+}
+
+/* 把取图路径渲染到设置面板，装机后不用连电脑就能看到 */
+function renderDiag() {
+  const el = document.getElementById('camDiag');
+  if (!el) return;
+  const t = devDiag.tone;
+  const toneTxt = !t ? '—'
+    : (typeof t === 'string' ? t
+      : 'black ' + t.black + ' / white ' + t.white + ' / γ ' + t.gamma +
+        (t.wb ? ' / WB ' + t.wb.join(',') : ''));
+  el.innerHTML =
+    '<div><span>预览流</span><b>' + (devDiag.stream || '—') + '</b></div>' +
+    '<div><span>取图</span><b class="' +
+      (devDiag.via && devDiag.via.indexOf('video') >= 0 ? 'bad' : '') + '">' +
+      (devDiag.via || '—') + (devDiag.raw ? ' · ' + devDiag.raw : '') + '</b></div>' +
+    '<div><span>成片</span><b>' + (devDiag.out || '—') + '</b></div>' +
+    '<div><span>影调</span><b>' + toneTxt + '</b></div>';
 }
 
 function startToneLoop() {
   stopToneLoop();
   refreshTone(true);
-  toneTimer = setInterval(() => { if (!document.hidden) refreshTone(false); }, 1800);
+  // 2.4s 一次：每轮都要 getImageData，是持续耗电和掉帧的来源之一。
+  // 影调只在场景明暗变化时才会动，这个频率足够。
+  toneTimer = setInterval(() => {
+    if (document.hidden) return;
+    if (!toneActive()) return;
+    refreshTone(false);
+  }, 2400);
 }
 
 function stopToneLoop() {
@@ -864,11 +908,9 @@ function composeCanvas(raw) {
     }
   }
 
-  // 影调修正：与取景器上所见的亮度保持一致（CSS filter 不会影响 drawImage，这里要显式再来一次）
-  const tf = toneFilter();
-  if (tf !== 'none') ctx.filter = tf;
+  // 影调不在这里做：CSS filter 只能近似，而且会二次损失动态范围。
+  // 构图完成后由 applyToneLut 用查找表精确处理。
   ctx.drawImage(srcEl, sX, sY, sW, sH, 0, 0, outW, outH);
-  ctx.filter = 'none';
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   return canvas;
 }
@@ -991,20 +1033,6 @@ function shutterFlash() {
   f.classList.add('run');
 }
 
-async function countdown(sec) {
-  const el = $('#countdown');
-  if (!el) { await new Promise(r => setTimeout(r, sec * 1000)); return; }
-  el.hidden = false;
-  for (let i = sec; i > 0; i--) {
-    el.textContent = String(i);
-    el.classList.remove('run');
-    void el.offsetWidth;
-    el.classList.add('run');
-    if (navigator.vibrate) navigator.vibrate(30);
-    await new Promise(r => setTimeout(r, 1000));
-  }
-  el.hidden = true;
-}
 
 async function capture() {
   if (busy) return;
@@ -1014,11 +1042,12 @@ async function capture() {
   if (btn) btn.disabled = true;
 
   try {
-    if (S.timer > 0) await countdown(S.timer);
     shutterFlash();
     showBusy('正在成像…');
 
     let raw = await grabBestImage();
+    devDiag.via = raw.via || '?';
+    devDiag.raw = raw.w + 'x' + raw.h;
 
     // takePhoto() 在部分机型上比预览帧明显更白（高光大片溢出）。
     // 同一时刻再抓一帧对比，原生图更糟就改用预览帧，宁可少点分辨率也不要白片。
@@ -1026,6 +1055,7 @@ async function capture() {
       const frame = grabFrame();
       const fs = statsOf(frame);
       if (WMCTone.shouldReplacePhoto(raw.stats, fs)) {
+        devDiag.via = 'capture→video(偏亮)';
         raw = { src: frame, w: frame.width, h: frame.height, via: 'video', stats: fs };
         console.info('[wmc] takePhoto 偏亮，已改用预览帧', raw.stats && raw.stats.blown, fs && fs.blown);
       }
@@ -1034,7 +1064,10 @@ async function capture() {
     const base = liveBase();
 
     const canvas = composeCanvas(raw);
-    lastRaw = cloneCanvas(canvas);   // 干净底图，留给「改水印」
+    lastRaw = cloneCanvas(canvas);   // 未套影调的构图，改水印时重算
+    devDiag.out = canvas.width + 'x' + canvas.height;
+    applyToneLut(canvas);
+    renderDiag();
     lastBase = base;
 
     showBusy('正在签名…');
@@ -1169,7 +1202,7 @@ async function reRender() {
   busy = true;
   showBusy('正在重新出图…');
   try {
-    const r = await renderPhoto(cloneCanvas(lastRaw), lastBase);
+    const r = await renderPhoto(applyToneLut(cloneCanvas(lastRaw)), lastBase);
     shotBlob = r.blob;
     shotCode = r.code;
     openPreview(r.blob, r.code);
@@ -1549,12 +1582,11 @@ function syncUI() {
   setSeg('segScale', String(S.wmScale));
   setSeg('segQuality', S.quality);
   setSeg('segCoord', S.coordFmt);
-  setSeg('segTimer', String(S.timer));
 
   $$('.style-item').forEach(it => it.classList.toggle('on', it.dataset.style === S.style));
   updateStatus();
   syncTools();
-  applyGrid();
+  applyLevel();
 }
 
 function setSeg(id, val) {
@@ -1566,25 +1598,12 @@ function setSeg(id, val) {
 function syncTools() {
   const t = document.getElementById('btnTorch');
   if (t) t.classList.toggle('on', torchOn);
-  const g = document.getElementById('btnGrid');
-  if (g) g.classList.toggle('on', !!S.grid);
   const l = document.getElementById('btnLevel');
   if (l) l.classList.toggle('on', !!S.level);
-  const tm = document.getElementById('btnTimer');
-  if (tm) {
-    tm.classList.toggle('on', S.timer > 0);
-    const sp = tm.querySelector('span');
-    if (sp) sp.textContent = S.timer > 0 ? S.timer + 's' : '定时';
-  }
   const ev = document.getElementById('evVal');
   if (ev) ev.textContent = (S.ev > 0 ? '+' : '') + Number(S.ev).toFixed(1);
   const sl = document.getElementById('evSlider');
   if (sl && Number(sl.value) !== Number(S.ev)) sl.value = S.ev;
-}
-
-function applyGrid() {
-  const g = document.getElementById('gridLines');
-  if (g) g.classList.toggle('show', !!S.grid);
 }
 
 async function fillFingerprint() {
@@ -1600,6 +1619,7 @@ async function fillFingerprint() {
 function openSheet() {
   syncUI();
   fillFingerprint();
+  renderDiag();
   $('#sheet').classList.add('show');
   $('#sheetMask').classList.add('show');
 }
@@ -1619,23 +1639,6 @@ function closeGallery() {
   $('#galleryMask').classList.remove('show');
 }
 
-/* ---------- 水平仪 ---------- */
-function initLevel() {
-  const el = $('#levelBar');
-  if (!el) return;
-  const onOrient = e => {
-    let deg = 0;
-    if (e.gamma != null) deg = e.gamma;         // 左右倾斜
-    if (Math.abs(deg) > 90) deg = 0;
-    const clamped = Math.max(-45, Math.min(45, deg));
-    el.style.transform = `rotate(${-clamped}deg)`;
-    el.classList.toggle('ok', Math.abs(deg) < 1.5);
-    el.classList.toggle('show', !!S.level);
-  };
-  if (window.DeviceOrientationEvent) {
-    window.addEventListener('deviceorientation', onOrient, true);
-  }
-}
 
 /* ---------- 绑定 ---------- */
 function bindUI() {
@@ -1694,7 +1697,6 @@ function bindUI() {
       saveSettings();
       if (key === 'autoTone') refreshTone(true);
       renderOverlay();
-      if (key === 'grid') applyGrid();
     });
   });
 
@@ -1716,8 +1718,7 @@ function bindUI() {
     ['segPos', v => { S.pos = v; }],
     ['segScale', v => { S.wmScale = Number(v); }],
     ['segQuality', v => { S.quality = v; }],
-    ['segCoord', v => { S.coordFmt = v; }],
-    ['segTimer', v => { S.timer = Number(v); }]
+    ['segCoord', v => { S.coordFmt = v; }]
   ];
   segs.forEach(([id, apply]) => {
     const box = document.getElementById(id);
@@ -1790,14 +1791,15 @@ function bindUI() {
 
   // 工具条
   $('#btnTorch').addEventListener('click', toggleTorch);
-  $('#btnGrid').addEventListener('click', () => { S.grid = !S.grid; saveSettings(); syncTools(); applyGrid(); });
-  $('#btnLevel').addEventListener('click', () => { S.level = !S.level; saveSettings(); syncTools(); });
-  $('#btnTimer').addEventListener('click', () => {
-    S.timer = S.timer === 0 ? 3 : (S.timer === 3 ? 10 : 0);
-    saveSettings(); syncTools(); renderOverlay();
-    toast(S.timer ? `定时 ${S.timer} 秒` : '定时已关闭');
+  const bl = $('#btnLevel');
+  if (bl) bl.addEventListener('click', () => {
+    S.level = !S.level;
+    saveSettings();
+    applyLevel();
+    syncTools();
+    if (S.level) initLevel();
+    toast(S.level ? '水平仪已开，转屏会自动换轴' : '水平仪已关');
   });
-
   const evSlider = $('#evSlider');
   if (evSlider) {
     evSlider.addEventListener('input', e => {
@@ -1852,9 +1854,10 @@ function boot() {
   bindUI();
   syncUI();
   initLevel();
+  initLevel();
   initGeo();
   startCamera();
-  setInterval(renderOverlay, 500);
+  setInterval(renderOverlay, 1000);
   setInterval(refreshUiCode, 1000);
   refreshUiCode();
   hideSplash();
