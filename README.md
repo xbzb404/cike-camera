@@ -101,7 +101,8 @@ python build/build_apk.py --no-sign          # 只出未签名包
 ```bash
 node tests/test-exif.js        # EXIF 写入 → 读取 往返（11 项）
 node tests/test-layout.js      # 8 样式 × 3 尺寸 × 3 位置 × 3 字号 = 216 组排版（重叠/越界）
-PW_PATH=<playwright-core 路径> node tests/e2e-capture.js   # 假摄像头真实拍摄 + 验真页闭环（14 项）
+                               #  + 24 组缩放一致性（字号必须随画布宽度等比变化）
+PW_PATH=<playwright-core 路径> node tests/e2e-capture.js   # 假摄像头真实拍摄 + 验真页闭环（16 项）
 ```
 
 `e2e-capture.js` 用 Chromium 的 `--use-fake-device-for-media-stream` 走完整链路：按快门 → 取图 → 水印 → EXIF → 签名 → 预览，然后把成片取出来，在 Node 里独立解析 EXIF、校验哈希、验签，并把图片喂给验真页确认判定结果。

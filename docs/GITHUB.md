@@ -1,9 +1,11 @@
 # 上传到 GitHub 前的清单
 
-本仓库已经完成 git 初始化与分提交，本地无遗留未提交改动（见 `git status`）。
-下面只是把「推上去」这一步留给你，因为它需要你的账号授权。
+**当前状态（2026-11-10）**：已上线 <https://github.com/xbzb404/cike-camera>，默认分支 `main`，标签 `v1.3.1` 已推。
+`origin` 走 SSH（`git@github.com:xbzb404/cike-camera.git`，端口 443），日常 `git push` 即可。
 
-## 一、先登录（只需一次）
+剩下两件需要账号授权的收尾（见本文第五、六节）：仓库 topics 与带 APK 的 Release。
+
+## 一、登录（换机器时才需要）
 
 ```bash
 gh auth login
@@ -17,7 +19,10 @@ gh auth login
 gh auth status
 ```
 
-## 二、创建仓库并推送
+> 只推送代码的话可以不装 `gh`：本机 SSH 密钥已经能推，`git push` 直接生效。
+> 只有建仓、加 topics、发 Release 这类 API 操作才需要 `gh` 或一个 PAT。
+
+## 二、首次建仓（已完成，留作换账号时参考）
 
 推荐仓库名 `cike-camera`（包名 `com.wmc.camera`；如果想用中文名，GitHub 也支持，但 URL 会变成百分号编码）。
 
@@ -32,7 +37,7 @@ gh repo create cike-camera --public --source=. --remote=origin --push \
 已有仓库、只想关联的话：
 
 ```bash
-git remote add origin https://github.com/<你的账号>/cike-camera.git
+git remote add origin git@github.com:<你的账号>/cike-camera.git
 git branch -M main
 git push -u origin main
 ```
