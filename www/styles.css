@@ -90,7 +90,9 @@ body.orient-lock #btnOrient{color:var(--accent);border-color:rgba(255,210,74,.45
   flex:0 1 auto;
   border-radius:18px;
   overflow:hidden;
-  background:#000;
+  /* 与 #app 同色：视野选「完整」时画面上下会留边，
+     这里若用纯黑，那两条边就像硬贴上去的黑框 */
+  background:#0a0e17;
   /* 尺寸由 JS 按摄像头画面比例计算，这里给相机未就绪时的兜底 */
   width:100%;
   height:100%;
@@ -101,7 +103,7 @@ body.orient-lock #btnOrient{color:var(--accent);border-color:rgba(255,210,74,.45
      contain 会在两侧或上下留大黑边（就是「取景框里画面小得可怜」），
      cover 让画面始终填满取景框。 */
   object-fit:cover;
-  background:#000;
+  background:#0a0e17;
   display:block;
 }
 /* 视野选「完整」时不裁切，保留全部场景，代价是可能留黑边 */

@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.4.3';
+const APP_VERSION = '1.4.4';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -37,7 +37,7 @@ const DEFAULTS = {
   pos: 'bl',            // bl | br | tl | tr（左下/右下/左上/右上）
   autoPos: true,        // 横屏时自动把水印挪到空着的角落
   size: '1080',         // 预览流长边：720 | 1080 | 1440
-  view: 'fill',         // fill 填满取景框 | wide 完整视角（不裁，可能留黑边）
+  view: 'wide',         // wide 完整视角（不裁，默认）| fill 填满取景框
   wmScale: 1,           // 0.85 | 1 | 1.15
   autoInk: true,        // 按底图亮度自动切深/浅墨水
   fields: [],           // 自定义字段 [{k,v}]
@@ -88,6 +88,10 @@ function readSettings() {
   if (POS_MAP[s.pos]) s.pos = POS_MAP[s.pos];
   if (!['bl', 'br', 'tl', 'tr'].includes(s.pos)) s.pos = 'bl';
   if (!['720', '1080', '1440'].includes(String(s.size))) s.size = '1080';
+  // 视野：老版本默认「填满」，会把 4:3 整幅裁掉两侧 44%，看着就像被拉近了。
+  // 一次性迁到「完整」，之后用户自己改回来就不再干预。
+  if (!s.viewMigrated) { s.view = 'wide'; s.viewMigrated = true; }
+  if (!['fill', 'wide'].includes(s.view)) s.view = 'wide';
   // 老用户的设置里没有这个字段，必须显式补 true，否则 Object.assign 之后是 undefined
   if (typeof s.autoPos !== 'boolean') s.autoPos = true;
   // EV 一律不继承历史值。
@@ -172,12 +176,16 @@ function setLive(on) {
 function grabPoster() {
   const p = $('#poster');
   if (!p) return;
-  const W = stage.clientWidth, H = stage.clientHeight;
-  if (!W || !H) return;
   if (!video.videoWidth || !video.videoHeight) return;
   // 手动指定过画面旋转的机型，这里的坐标换算容易出错，直接放弃抓帧，
-  // 退回纯黑底（总比 WebView 的播放按钮好看）
+  // 退回纯色底（总比 WebView 的播放按钮好看）
   if (videoRotDeg()) return;
+
+  // 只抓「画面」那一块，不是整张卡片：视野选完整时上下有留边，
+  // 把留边也抓进去会让静态帧看起来比实时画面更宽。
+  const fr = frameRect();
+  const W = fr.w, H = fr.h;
+  if (!W || !H) return;
 
   const vw = video.videoWidth, vh = video.videoHeight;
   const k = Math.min(1, 600 / Math.max(W, H));
@@ -187,14 +195,12 @@ function grabPoster() {
   c.width = cw; c.height = ch;
   const ctx = c.getContext('2d');
   if (!ctx) return;
-  ctx.fillStyle = '#000';
+  ctx.fillStyle = '#0a0e17';
   ctx.fillRect(0, 0, cw, ch);
 
-  // 与 CSS 的 object-fit 保持一致：fill=cover 裁边，wide=contain 留黑边
+  // 与 CSS 的 object-fit 保持一致：fill 用 cover 裁边，wide 用 contain 铺满那块矩形
   const cover = S.view !== 'wide';
-  const s = cover
-    ? Math.max(cw / vw, ch / vh)
-    : Math.min(cw / vw, ch / vh);
+  const s = cover ? Math.max(cw / vw, ch / vh) : Math.min(cw / vw, ch / vh);
   const dw = vw * s, dh = vh * s;
   ctx.save();
   ctx.translate(cw / 2, ch / 2);
@@ -204,10 +210,17 @@ function grabPoster() {
 
   // 水印是画在 overlay 上的独立图层，不一起烤进去的话，
   // 切后台那一刻水印会「消失」，看起来像画面断了一截。
+  // overlay 与画面区域同尺寸，直接 1:1 贴上去。
   const ov = $('#overlay');
   if (ov && ov.width) {
     try { ctx.drawImage(ov, 0, 0, cw, ch); } catch (e) {}
   }
+
+  // 静态帧也只占画面那块，位置跟着 frameRect 走
+  p.style.left = fr.x + 'px';
+  p.style.top = fr.y + 'px';
+  p.style.width = W + 'px';
+  p.style.height = H + 'px';
 
   // 切后台时同步执行，0.78 的质量在 600px 上大约 40~60KB，代价可接受
   try { p.src = c.toDataURL('image/jpeg', 0.78); } catch (e) {}
@@ -244,22 +257,62 @@ async function restartCamera() {
    于是三个症状一起出现：卡（帧率低）、糊（长时间曝光带来运动模糊）、
    发白（同一场景下更长的积分 = 更高的平均亮度）。
    原生相机的做法本来就是「预览用低分辨率保流畅，拍照走满幅」，这里照做。 */
+/* ---------- 屏幕刷新率 ----------
+   Web 没有 API 能直接读屏幕 Hz，但 rAF 的回调节奏就是屏幕的刷新节奏：
+   120Hz 屏每 8.3ms 回调一次，60Hz 是 16.7ms。取 30 帧间隔的中位数再吸附到
+   常见档位，就能把 60 / 90 / 120 分出来（偶发掉帧不会误判）。 */
+let screenHz = 0;
+let renderFps = 0;
+
+function detectRefreshRate() {
+  return new Promise(res => {
+    const gaps = [];
+    let last = 0, n = 0;
+    const tick = ts => {
+      if (last) gaps.push(ts - last);
+      last = ts;
+      if (++n < 31) { requestAnimationFrame(tick); return; }
+      if (!gaps.length) { res(60); return; }
+      gaps.sort((a, b) => a - b);
+      const med = gaps[Math.floor(gaps.length / 2)] || 16.7;
+      const raw = 1000 / med;
+      const cand = [30, 48, 60, 90, 120, 144];
+      let best = 60, diff = 1e9;
+      for (const c of cand) {
+        const d = Math.abs(c - raw);
+        if (d < diff) { diff = d; best = c; }
+      }
+      res(diff < 7 ? best : Math.round(raw));
+    };
+    requestAnimationFrame(tick);
+  });
+}
+
+/* 摄像头预览的实际上限普遍是 60fps，屏幕再高也没用；
+   屏幕本身只有 30Hz（省电模式）时就没必要硬拉。 */
+function targetFps() {
+  const hz = screenHz || 60;
+  return hz < 45 ? Math.max(24, hz) : 60;
+}
+
+/* ---------- 预览流约束 ----------
+   两个历史包袱都在这里，别改回去：
+
+   ① 尺寸一律按 **4:3 横版** 要。传感器是横的，WebView 能给的整幅档位也是
+     1440×1080 / 1920×1080 这一类。以前按竖版 810×1080 要，浏览器为了填满
+     竖框，会从整幅里**裁**出中间一条交给你 —— 这就是「视角被拉近 2 倍多」
+     的真正原因，跟 CSS 的 cover 无关。
+
+   ② 绝不给 aspectRatio。理由同上：它会让浏览器用裁切来凑比例。
+
+   帧率按屏幕刷新率给，用户那块 120Hz 屏不该只跑 30。 */
 function streamConstraint() {
-  const longEdge = Number(S.size) || 1080;
-  const land = isLandscape();
-  // 长边取用户所选，短边按 3:4 折算（与手机竖握时传感器的裁切比例一致）
-  const w = land ? longEdge : Math.round(longEdge * 3 / 4);
-  const h = land ? Math.round(longEdge * 3 / 4) : longEdge;
-  // 注意：这里**故意不给 aspectRatio**。
-  // 之前写了 aspectRatio: { ideal: w/h }，浏览器为了让流满足这个比例，
-  // 会把传感器给的 16:9 / 4:3 全幅做**中心裁切**再交出来 —— 这等于平白
-  // 加了一个 1.5~1.8 倍的数码变焦，用户看到的就是「视角被拉近」。
-  // 只报尺寸，让 WebView 返回最接近的原生档位（一般是 1440×1080），
-  // 裁不裁、怎么裁由前端 CSS 决定，摄像头这边保持全幅。
+  const h = Number(S.size) || 1080;
+  const w = Math.round(h * 4 / 3);
   return {
     width: { ideal: w },
     height: { ideal: h },
-    frameRate: { ideal: 30 }
+    frameRate: { ideal: targetFps(), min: 24 }
   };
 }
 
@@ -268,6 +321,32 @@ function streamConstraint() {
    用一个代次号把过期的启动请求全部作废。 */
 let startSeq = 0;
 let camStarting = false;
+
+/* 打开一路流，失败就逐级降级。
+   有些设备（包括浏览器自带的假摄像头）不接受「分辨率 + 帧率」这种复合约束，
+   会直接抛 OverconstrainedError —— 表现就是「没找到可用摄像头」。
+   降级顺序：完整约束 → 只保留尺寸 → 只要能出画面。 */
+async function openStream(deviceId, video0) {
+  const base = () => (deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: facing } });
+  const tries = [
+    video0,
+    Object.assign(base(), { width: { ideal: video0.width.ideal }, height: { ideal: video0.height.ideal } }),
+    base()
+  ];
+  let lastErr = null;
+  for (const v of tries) {
+    try {
+      const got = await navigator.mediaDevices.getUserMedia({ audio: false, video: v });
+      if (got && got.getVideoTracks().length) return got;
+      got && got.getTracks().forEach(t => t.stop());
+    } catch (e) {
+      lastErr = e;
+      // 权限被拒就别再试了，降级也打不开
+      if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) throw e;
+    }
+  }
+  throw lastErr || new Error('NotFoundError');
+}
 
 async function startCamera(deviceId, opts) {
   const keepLenses = !!(opts && opts.keepLenses);
@@ -290,7 +369,7 @@ async function startCamera(deviceId, opts) {
     if (deviceId) video0.deviceId = { exact: deviceId };
     else video0.facingMode = { ideal: facing };
 
-    const got = await navigator.mediaDevices.getUserMedia({ audio: false, video: video0 });
+    const got = await openStream(deviceId, video0);
     if (seq !== startSeq) {
       // 期间又有人发起了新的启动，这次的流直接扔掉，否则两路流会打架
       got.getTracks().forEach(t => t.stop());
@@ -530,9 +609,13 @@ async function applyZoom(z) {
 stage.addEventListener('click', e => {
   if (!trackRef) return;
   const r = stage.getBoundingClientRect();
-  const x = (e.clientX - r.left) / r.width;
-  const y = (e.clientY - r.top) / r.height;
-  focusAt(x, y, e.clientX - r.left, e.clientY - r.top);
+  const fr = frameRect();
+  const px = e.clientX - r.left;
+  const py = e.clientY - r.top;
+  // 点在留边上时按最近的画面边界算，别把归一化坐标算出 [0,1] 之外
+  const x = Math.min(1, Math.max(0, (px - fr.x) / fr.w));
+  const y = Math.min(1, Math.max(0, (py - fr.y) / fr.h));
+  focusAt(x, y, px, py);
 });
 
 let focusLocked = false;
@@ -812,10 +895,27 @@ function effPos() {
   return isLandscape() ? 'tr' : S.pos;
 }
 
+/* 画面在取景框里实际占的那块矩形。
+   视野选「完整」（contain）时上下或左右会留边，水印必须落在**画面**里，
+   否则会飘到留边上，看起来悬空、还压不到实景。 */
+function frameRect() {
+  const W = stage.clientWidth, H = stage.clientHeight;
+  if (!W || !H) return { x: 0, y: 0, w: W || 1, h: H || 1 };
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (S.view !== 'wide' || !vw || !vh) return { x: 0, y: 0, w: W, h: H };
+  const s = Math.min(W / vw, H / vh);
+  if (!isFinite(s) || s <= 0) return { x: 0, y: 0, w: W, h: H };
+  const w = Math.round(vw * s), h = Math.round(vh * s);
+  return { x: Math.round((W - w) / 2), y: Math.round((H - h) / 2), w, h };
+}
+
 function renderOverlay() {
-  const W = stage.clientWidth;
-  const H = stage.clientHeight;
-  if (!W || !H || !video.videoWidth || document.hidden) return;
+  if (!video.videoWidth || document.hidden) return;
+  // overlay 只盖住画面本身，不盖整张取景框卡片 ——
+  // 这样水印的「左下角」就是画面的左下角，和成片一致
+  const fr = frameRect();
+  const W = fr.w, H = fr.h;
+  if (!W || !H) return;
 
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const pw = Math.round(W * dpr);
@@ -826,6 +926,8 @@ function renderOverlay() {
     overlay.style.width = W + 'px';
     overlay.style.height = H + 'px';
   }
+  overlay.style.left = fr.x + 'px';
+  overlay.style.top = fr.y + 'px';
   const ctx = overlay.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
@@ -881,7 +983,7 @@ let tone = { lut: null, preview: 'none', key: '' };
 
 /* 取图路径诊断：装机后能直接在设置里看到这次到底走了哪条路，
    不用连电脑抓 console。字段刻意短，方便截图反馈。 */
-const devDiag = { stream: '', via: '', raw: '', out: '', tone: null };
+const devDiag = { stream: '', via: '', raw: '', out: '', tone: null, hz: 0, fps: 0 };
 let toneTimer = 0;
 let toneCanvas = null;
 
@@ -1030,6 +1132,27 @@ function applyLevel() {
 }
 
 /* 把取图路径渲染到设置面板，装机后不用连电脑就能看到 */
+/* 实测预览渲染帧率。rAF 的回调节奏就是屏幕真正刷出来的节奏，
+   和摄像头给的帧率、WebView 的合成能力都对得上。
+   每 8 秒测 1 秒，避免常驻 rAF 白耗电。 */
+function startFpsMeter() {
+  const once = () => {
+    if (document.hidden || !video.srcObject) return;
+    let n = 0, t0 = 0;
+    const loop = ts => {
+      if (!t0) t0 = ts;
+      n++;
+      if (ts - t0 < 1000) { requestAnimationFrame(loop); return; }
+      renderFps = n;
+      devDiag.fps = n;
+      renderDiag();
+    };
+    requestAnimationFrame(loop);
+  };
+  setTimeout(once, 2500);
+  setInterval(once, 8000);
+}
+
 function renderDiag() {
   const el = document.getElementById('camDiag');
   if (!el) return;
@@ -1041,6 +1164,9 @@ function renderDiag() {
         (t.wb ? ' / WB ' + t.wb.join(',') : ''));
   el.innerHTML =
     '<div><span>预览流</span><b>' + (devDiag.stream || '—') + '</b></div>' +
+    '<div><span>屏幕 / 实际</span><b>' +
+      (devDiag.hz ? devDiag.hz + 'Hz' : '—') + ' / ' +
+      (devDiag.fps ? devDiag.fps + 'fps' : '—') + '</b></div>' +
     '<div><span>取图</span><b class="' +
       (devDiag.via && devDiag.via.indexOf('video') >= 0 ? 'bad' : '') + '">' +
       (devDiag.via || '—') + (devDiag.raw ? ' · ' + devDiag.raw : '') + '</b></div>' +
@@ -2026,7 +2152,7 @@ function syncUI() {
   setSeg('segScale', String(S.wmScale));
   setSeg('segQuality', S.quality);
   setSeg('segSize', String(S.size));
-  setSeg('segView', S.view || 'fill');
+  setSeg('segView', S.view || 'wide');
   setSeg('segRot', String(S.videoRot || 'auto'));
   setSeg('segCoord', S.coordFmt);
 
@@ -2328,7 +2454,18 @@ function boot() {
   initLevel();
   initOrientation();
   initGeo();
+  // 先用 60fps 的默认值开流，别让用户干等刷新率测完
   startCamera();
+  detectRefreshRate().then(hz => {
+    screenHz = hz;
+    devDiag.hz = hz;
+    renderDiag();
+    // 只有「屏幕本身就低刷」时才值得重开一路流；高刷屏的上限仍是 60
+    if (targetFps() < 60 && video.srcObject && !camStarting) {
+      startCamera(curDeviceId, { keepLenses: true });
+    }
+  });
+  startFpsMeter();
   setInterval(renderOverlay, 1000);
   setInterval(refreshUiCode, 1000);
   refreshUiCode();
