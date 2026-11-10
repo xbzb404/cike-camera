@@ -1,4 +1,4 @@
-const CACHE = 'wmc-v9';
+const CACHE = 'wmc-v10';
 const ASSETS = [
   './',
   './index.html',

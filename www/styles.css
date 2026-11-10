@@ -946,36 +946,23 @@ body.full .controls{
 }
 body.full .controls>*{pointer-events:auto}
 
-/* 横屏时纵向空间本来就紧张（手机横过来只有一千来像素高），工具条
-   不能再单独占一行，否则取景会被挤成一条横带。这里让它浮到画面左上，
-   只占左侧不到一半宽度 —— 右边整块留给水印（横屏时水印自动挪到右上角）。
-   去掉 backdrop-filter：横屏每帧都要额外做一次模糊，属于纯浪费。 */
-body.land .bars{
-  position:absolute;top:6px;left:6px;right:auto;z-index:6;
-  width:auto;max-width:52%;
-  flex-direction:row;align-items:flex-start;gap:6px;
-  padding:0;background:none;
-}
-/* 非全屏时 .stage-col 还在文档流里，要给绝对定位的工具条一个参照系；
-   全屏时它已经是 absolute inset:0，别覆盖 */
-body.land:not(.full) .stage-col{position:relative;gap:0}
+/* 横屏：组件一个都不搬。
+   以前这里把工具条 absolute 到画面左上、黑边够宽时还竖排搬进左侧黑边，
+   结果就是「横过来整套界面换了位置」。现在维持和竖屏完全相同的结构
+   （顶栏 → 取景框 → 工具条 → 快门），旋转只改两件事：
+     · 取景框比例从 3:4 变成 4:3（同一张框转 90°）；
+     · 水印按旋转方向落到同一个逻辑角（左下还是左下）。
+   横屏纵向空间本来就紧，所以只把上下留白压掉，把高度还给画面 ——
+   位置不动，尺寸不变。 */
+body.land .topbar{padding:4px 12px 0}
+body.land .stage-wrap{padding:2px 12px}
+body.land .stage-col{gap:6px}
+body.land .bars{gap:5px}
+body.land .controls{padding:0 24px calc(4px + var(--safe-b))}
+/* 快门只缩一圈（不动位置），把省下的高度全给画面 */
+body.land .shutter{width:64px;height:64px}
+body.land .shutter span{width:52px;height:52px}
 
-/* 横屏非全屏：取景框按 4:3 居中，左右必然空出黑边。黑边够宽时（JS 判定
-   左侧剩余 ≥150px 才挂 .side-bars）把工具条竖着搬进左边那块黑边 ——
-   它就不再压在画面上，界面也不用为它重排一遍。 */
-body.side-bars .bars{
-  position:absolute;z-index:6;
-  left:5px;right:auto;top:50%;
-  transform:translateY(-50%);
-  width:auto;max-width:168px;
-  flex-direction:column;align-items:flex-start;gap:6px;
-  padding:0;background:none;
-}
-body.side-bars .toolbar{
-  flex-direction:column;align-items:flex-start;gap:5px;
-  overflow:visible;max-width:100%;
-}
-body.side-bars .style-btn{padding:5px 9px;font-size:11px}
 /* 全屏：顶栏浮在最上面，工具条就往下让出它的高度（竖屏、横屏同理） */
 body.full .bars{
   position:absolute;z-index:6;
@@ -1003,13 +990,6 @@ body.full .topbar{
 body.full .topbar>*{pointer-events:auto}
 /* 横屏不显示标题：转 90° 之后它会变成一竖行贴边文字，纯属干扰 */
 body.full .brand{display:none}
-body.land .icon-btn{width:34px;height:34px}
-
-body.land .shutter{width:56px;height:56px}
-body.land .shutter span{width:44px;height:44px}
-body.land .side-btn{width:44px;gap:0}
-body.land .side-btn span{display:none}
-body.land .side-btn svg{width:20px;height:20px}
 body.full .level-wrap{width:min(42%,200px)}
 
 /* ---------- 全屏：控件一律透明，图标直接浮在画面之上 ----------

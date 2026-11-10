@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.5.1';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -39,7 +39,6 @@ const DEFAULTS = {
   view: 'fill',         // fill 填满取景框（默认，取景框尽量大）| wide 完整视角
   full: false,          // 全屏取景（只能手动开，退出用右上角按钮）
   wmScale: 1,           // 0.85 | 1 | 1.15
-  autoInk: true,        // 按底图亮度自动切深/浅墨水
   fields: [],           // 自定义字段 [{k,v}]
   showTime: true,
   showSeconds: true,
@@ -1074,8 +1073,10 @@ function layoutStage() {
   } else {
     availW = stageWrap.clientWidth - padL - padR;
     availH = stageWrap.clientHeight - padT - padB;
+    // 工具条现在竖屏横屏都待在文档流里（横屏不再搬去左侧黑边），
+    // 它占掉的那一行必须从可用高度里扣出来，否则取景框会顶到它底下。
     const bar = $('.bars');
-    if (bar && !land) availH -= bar.offsetHeight + 10;
+    if (bar) availH -= bar.offsetHeight + 10;
   }
   if (availW <= 0 || availH <= 0) return;
 
@@ -1109,17 +1110,8 @@ function layoutStage() {
   // 视野：wide 时 video 用 contain（整幅都看得见，代价是留边）
   stage.classList.toggle('view-wide', S.view === 'wide');
 
-  // 横屏非全屏：取景框 4:3 居中，左右必然留出黑边。黑边够宽时把工具条
-  // 搬进左边那块黑边（CSS 竖排），工具条就不再压在画面上 —— 界面不用
-  // 重排，画面也不用为它让位置。黑边不够（窄屏横放）就退回原来浮在左上。
-  if (land && !full) {
-    let leftRoom = 0;
-    try { leftRoom = stage.getBoundingClientRect().left; } catch (e) { leftRoom = 0; }
-    document.body.classList.toggle('side-bars', leftRoom >= 150);
-  } else {
-    document.body.classList.remove('side-bars');
-  }
-
+  // 横屏不再重排界面：工具条、快门、顶栏都留在竖屏时的位置上，
+  // 唯一的变化是取景框按 4:3 重算、水印按旋转后的方向落到同一个角。
   applyVideoTransform();
   renderOverlay();
 }
@@ -1130,10 +1122,11 @@ function isTopPos(p) { return p === 'top' || p === 'tl' || p === 'tr'; }
 function isRightPos(p) { return p === 'br' || p === 'tr'; }
 
 /* 水印落点 = 用户选的那个角，旋转不改。
-   以前横屏会自动跳到右上角（因为工具条浮在左上、快门压在下边），
-   结果「右下角的水印转一下跑到右上角」，用户第一眼就看出不对。
-   现在横屏的工具条搬进了左侧黑边、快门在画面之外，贴角没人挡，
-   所以水印就老老实实待在同一个角 —— 旋转时唯一该变的就是画面和水印。 */
+   横屏时画面整体转了 90°，水印跟着画面一起转，落在「旋转之后的那个角」
+   —— 左下还是左下，只是屏幕上的物理位置跟着转。这就是用户要的
+   「按旋转方向旋转，并移动到左下位置」。
+   以前横屏会自动跳到右上角，结果「右下角的水印转一下跑到右上角」，
+   一眼就看出不对，已经去掉了。 */
 function effPos() {
   return S.pos;
 }
@@ -1160,7 +1153,13 @@ function renderOverlay() {
   const W = fr.w, H = fr.h;
   if (!W || !H) return;
 
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  // dpr 以前被钳在 2，可多数安卓机是 2.75 / 3 —— canvas 按 2 倍渲染，
+  // 再被浏览器放大到 3 倍物理像素上显示，水印文字的边缘就被拉出一圈
+  // 灰白色的雾（用户说的「文字雾化」「底部白雾」就是这个）。
+  // 现在跟到真实 dpr（上限 3），同时给总像素封顶，避免大屏全屏吃爆内存。
+  let dpr = Math.min(window.devicePixelRatio || 1, 3);
+  const MAX_PX = 1.2e7;
+  if (W * H * dpr * dpr > MAX_PX) dpr = Math.sqrt(MAX_PX / (W * H));
   const pw = Math.round(W * dpr);
   const ph = Math.round(H * dpr);
   if (overlay.width !== pw || overlay.height !== ph) {
@@ -1176,16 +1175,14 @@ function renderOverlay() {
   ctx.clearRect(0, 0, W, H);
 
   const d = WM.buildData(displayBase(liveBase()), S, uiCode);
-  // 取景器里底图就是视频，亮度直接从 video 采样
+  // 水印配色固定：不再按底图明暗自动切深/浅墨水。
+  // 自动切换的问题是在浅色墙面/白纸前会突然变成深色字，同一台机器同一个
+  // 角落来回跳，看着像「水印在变色」。现在一律用深底白字那套。
   const pos = effPos();
-  let ink = 'dark';
-  if (S.autoInk) {
-    try { ink = sampleVideoInk(pos); } catch (e) { ink = 'dark'; }
-  }
-  // 什么时候水印要给界面让位？
-  //   全屏：顶栏、工具条、快门全是浮层，压在画面上，贴角会被盖住；
-  //   非全屏：控件都在画面之外（横屏的工具条还搬进了左侧黑边），不用让。
-  // 以前横屏也整体平移，结果水印既换了角又缩了位置，看着很怪。
+  const ink = 'dark';
+  // 只有全屏才给界面让位：顶栏、工具条、快门都变成浮层压在画面上，
+  // 贴角的水印会被盖住。非全屏时控件都在画面之外（横屏也一样，不搬位置），
+  // 水印老老实实贴角就行。
   ctx.save();
   if (S.full) {
     const topEl = $('.topbar'), botEl = $('.controls');
@@ -1203,26 +1200,6 @@ function renderOverlay() {
   ctx.restore();
 }
 
-let inkCanvas = null;
-function sampleVideoInk(pos) {
-  if (!video.videoWidth) return 'dark';
-  if (!inkCanvas) {
-    inkCanvas = document.createElement('canvas');
-    inkCanvas.width = 24;
-    inkCanvas.height = 16;
-  }
-  const c = inkCanvas.getContext('2d', { willReadFrequently: true });
-  // 与水印区域对应的源区域：按落点取对应的那个角，而不是永远取整条横带
-  const bw = Math.round(video.videoWidth * 0.62);
-  const bh = Math.round(video.videoHeight * 0.34);
-  const sx = isRightPos(pos) ? video.videoWidth - bw : 0;
-  const sy = isTopPos(pos) ? 0 : video.videoHeight - bh;
-  c.drawImage(video, sx, sy, bw, bh, 0, 0, 24, 16);
-  const px = c.getImageData(0, 0, 24, 16).data;
-  let sum = 0;
-  for (let i = 0; i < px.length; i += 4) sum += 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
-  return (sum / (px.length / 4) / 255) > 0.62 ? 'light' : 'dark';
-}
 
 /* ---------- 曝光 / 影调 ----------
    「拍出来发白」有三个来源，这里一并处理：
@@ -1956,12 +1933,9 @@ async function renderPhoto(canvas, base, override) {
     code = await WMC.makeCode(core);
   }
 
-  // 取色 → 决定墨水
+  // 水印配色固定（深底白字），不跟着底图明暗变
   const ctx = canvas.getContext('2d');
-  let ink = 'dark';
-  if (st.autoInk) {
-    try { ink = WM.measureInk(ctx, canvas.width, canvas.height, st.pos === 'top' ? 'top' : 'bottom'); } catch (e) {}
-  }
+  const ink = 'dark';
 
   const d = WM.buildData(displayBase(base), st, code);
   WM.draw(ctx, canvas.width, canvas.height, d, {
@@ -2578,10 +2552,8 @@ function paintStyleThumbs() {
   const bh = (c0 && c0.height) || 340;
   const base = snapshotFrame(bw, bh);
   const d = WM.buildData(displayBase(liveBase()), S, uiCode);
-  let ink = 'dark';
-  if (S.autoInk) {
-    try { ink = WM.measureInk(base.getContext('2d'), bw, bh, effPos()); } catch (e) {}
-  }
+  // 与预览、成片同一套固定配色，缩略图才不会跟实际出片对不上
+  const ink = 'dark';
   grid.querySelectorAll('.style-item').forEach(item => {
     const c = item.querySelector('canvas');
     const ctx = c.getContext('2d');
@@ -2618,7 +2590,7 @@ function syncUI() {
     swTime: 'showTime', swSeconds: 'showSeconds', swPlace: 'showPlace',
     swCoords: 'showCoords', swWeather: 'showWeather', swCode: 'showCode',
     swGcj: 'coordGcj', swAlt: 'showAltitude', swAcc: 'showAccuracy',
-    swInk: 'autoInk', swExif: 'writeExif', swSmart: 'smartPick', swGrid: 'grid',
+    swExif: 'writeExif', swSmart: 'smartPick', swGrid: 'grid',
     swTone: 'autoTone'
   };
   for (const id in map) {
@@ -2787,7 +2759,7 @@ function bindUI() {
     ['#swTime', 'showTime'], ['#swSeconds', 'showSeconds'], ['#swPlace', 'showPlace'],
     ['#swCoords', 'showCoords'], ['#swWeather', 'showWeather'], ['#swCode', 'showCode'],
     ['#swGcj', 'coordGcj'], ['#swAlt', 'showAltitude'], ['#swAcc', 'showAccuracy'],
-    ['#swInk', 'autoInk'], ['#swExif', 'writeExif'], ['#swSmart', 'smartPick'],
+    ['#swExif', 'writeExif'], ['#swSmart', 'smartPick'],
     ['#swTone', 'autoTone']
   ];
   toggles.forEach(([sel, key]) => {
