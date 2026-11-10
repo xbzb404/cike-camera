@@ -101,7 +101,65 @@
     return out;
   }
 
-  const API = { toGray, laplacian, focusScore, selectBest, downscalePlan };
+  /**
+   * 非锐化掩模（unsharp mask），就地修改 imageData。
+   *
+   * 为什么成片必须过这一步：
+   * WebView 拿到的预览流已经经历过「传感器 → YUV → 纹理 → 再编码」，
+   * 每一步都是一次低通，边缘的高频被削掉一层。原生相机之所以看着锐，
+   * 一半是 ISP 在出图前就做了边缘增强。我们拿不到 RAW，只能事后补。
+   *
+   * 用 4 邻域均值当模糊层，中心加权还原：
+   *   out = v + (v - blur) * amount
+   * amount 取 0.35~0.7 是安全区；再高会在文字和桌沿上出白边（halo）。
+   *
+   * 限制：超过 maxPixels 就跳过 —— 12MP 逐像素跑 JS 要 600ms 以上，
+   * 用户按完快门等太久反而更像「卡住」。宁可轻微软一点也不迟滞。
+   */
+  function unsharp(imageData, w, h, amount, maxPixels) {
+    if (!imageData || w < 3 || h < 3) return imageData;
+    const cap = maxPixels == null ? 8.4e6 : maxPixels;
+    if (w * h > cap) return imageData;
+
+    const a = amount == null ? 0.55 : Math.max(0, Math.min(1.2, amount));
+    if (a <= 0.001) return imageData;
+
+    const src = imageData.data;
+    const out = new Uint8ClampedArray(src.length);
+    const w4 = w * 4;
+
+    // 第一行与最后一行原样拷贝，省掉内层的边界判断
+    for (let x = 0; x < w; x++) {
+      const t = x * 4, b = (src.length - w4) + t;
+      out[t] = src[t]; out[t + 1] = src[t + 1]; out[t + 2] = src[t + 2]; out[t + 3] = src[t + 3];
+      out[b] = src[b]; out[b + 1] = src[b + 1]; out[b + 2] = src[b + 2]; out[b + 3] = src[b + 3];
+    }
+
+    for (let y = 1; y < h - 1; y++) {
+      const row = y * w4;
+      // 每行首尾像素同样原样保留
+      let i = row;
+      out[i] = src[i]; out[i + 1] = src[i + 1]; out[i + 2] = src[i + 2]; out[i + 3] = src[i + 3];
+      i = row + (w - 1) * 4;
+      out[i] = src[i]; out[i + 1] = src[i + 1]; out[i + 2] = src[i + 2]; out[i + 3] = src[i + 3];
+
+      for (let x = 1; x < w - 1; x++) {
+        i = row + x * 4;
+        const iu = i - w4, id = i + w4, il = i - 4, ir = i + 4;
+        for (let c = 0; c < 3; c++) {
+          const v = src[i + c];
+          const blur = (src[iu + c] + src[id + c] + src[il + c] + src[ir + c]) * 0.25;
+          out[i + c] = v + (v - blur) * a;
+        }
+        out[i + 3] = src[i + 3];
+      }
+    }
+
+    src.set(out);
+    return imageData;
+  }
+
+  const API = { toGray, laplacian, focusScore, selectBest, downscalePlan, unsharp };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else root.WMImg = API;
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -137,5 +137,71 @@ ok('每一步都严格小于上一步、大于目标', () => {
   }
 });
 
+/* ---------------- 锐化 ---------------- */
+function ramp(w, h) {
+  // 一条硬边：左半 60，右半 190。锐化会在边缘两侧拉出过冲
+  const d = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const v = x < w / 2 ? 60 : 190;
+      d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+    }
+  }
+  return { data: d, width: w, height: h };
+}
+
+ok('锐化在硬边两侧拉出过冲（暗侧更暗、亮侧更亮）', () => {
+  const w = 32, h = 16;
+  const img = ramp(w, h);
+  const before = Array.from(img.data);
+  Img.unsharp(img, w, h, 0.6);
+  const row = 8 * w;
+  const left = (row + w / 2 - 1) * 4;   // 边左侧最后一个像素
+  const right = (row + w / 2) * 4;      // 边右侧第一个像素
+  assert.ok(img.data[left] < before[left], '暗侧应更暗：' + img.data[left] + ' vs ' + before[left]);
+  assert.ok(img.data[right] > before[right], '亮侧应更亮：' + img.data[right] + ' vs ' + before[right]);
+});
+
+ok('锐化不改变平坦区域与透明度', () => {
+  const w = 16, h = 16;
+  const d = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < d.length; i += 4) { d[i] = d[i + 1] = d[i + 2] = 128; d[i + 3] = 200; }
+  const img = { data: d, width: w, height: h };
+  Img.unsharp(img, w, h, 0.8);
+  for (let i = 0; i < d.length; i += 4) {
+    assert.strictEqual(d[i], 128, '平坦区不应被改变');
+    assert.strictEqual(d[i + 3], 200, 'alpha 不应被改变');
+  }
+});
+
+ok('强度为 0 时是恒等变换', () => {
+  const w = 24, h = 8;
+  const img = ramp(w, h);
+  const before = Array.from(img.data);
+  Img.unsharp(img, w, h, 0);
+  assert.deepStrictEqual(Array.from(img.data), before);
+});
+
+ok('超过像素上限时跳过（避免 12MP 逐像素卡住快门）', () => {
+  const w = 40, h = 40;
+  const img = ramp(w, h);
+  const before = Array.from(img.data);
+  Img.unsharp(img, w, h, 0.6, 100);
+  assert.deepStrictEqual(Array.from(img.data), before);
+});
+
+ok('边缘一圈像素原样保留，不会越界读', () => {
+  const w = 12, h = 12;
+  const img = ramp(w, h);
+  const before = Array.from(img.data);
+  Img.unsharp(img, w, h, 0.9);
+  for (let x = 0; x < w; x++) {
+    const t = x * 4, b = ((h - 1) * w + x) * 4;
+    assert.strictEqual(img.data[t], before[t]);
+    assert.strictEqual(img.data[b], before[b]);
+  }
+});
+
 console.log('\n通过 ' + pass + ' / ' + (pass + fail));
 process.exit(fail ? 1 : 0);

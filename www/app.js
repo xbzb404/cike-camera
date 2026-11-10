@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.4.4';
+const APP_VERSION = '1.4.5';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -983,7 +983,7 @@ let tone = { lut: null, preview: 'none', key: '' };
 
 /* 取图路径诊断：装机后能直接在设置里看到这次到底走了哪条路，
    不用连电脑抓 console。字段刻意短，方便截图反馈。 */
-const devDiag = { stream: '', via: '', raw: '', out: '', tone: null, hz: 0, fps: 0 };
+const devDiag = { stream: '', via: '', raw: '', out: '', tone: null, hz: 0, fps: 0, af: '', sharp: null };
 let toneTimer = 0;
 let toneCanvas = null;
 
@@ -1080,6 +1080,37 @@ function applyToneLut(canvas) {
   return canvas;
 }
 
+/* 成片锐化。
+   预览流在到达我们手里之前已经被低通了好几轮（YUV 转换、纹理缩放、编解码），
+   边缘的高频掉了一层 —— 这是「看着软」的直接来源之一。原生相机之所以锐，
+   一半功劳在 ISP 出图前的边缘增强；我们拿不到 RAW，只能在合成后补一次
+   非锐化掩模。
+
+   顺序很关键：必须在影调之后、画水印之前。
+   · 放在影调之前：S 曲线会把锐化产生的过冲再放大，暗部边缘出白边；
+   · 放在水印之后：水印文字会被一起锐化，笔画发毛。
+   强度随缩放比例微调：被放大过的图原本更软，给得多一点；
+   缩小过的本身够紧，给多了显脏。 */
+function sharpenCanvas(canvas, raw) {
+  if (!window.WMImg || !WMImg.unsharp) return canvas;
+  try {
+    const srcW = (raw && raw.w) || 0;
+    const ratio = srcW ? canvas.width / srcW : 1;
+    let amount = 0.52;
+    if (ratio > 1.05) amount = 0.7;
+    else if (ratio < 0.9) amount = 0.42;
+
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    WMImg.unsharp(img, canvas.width, canvas.height, amount, 8.4e6);
+    ctx.putImageData(img, 0, 0);
+    devDiag.sharp = { amount: +amount.toFixed(2), px: canvas.width * canvas.height };
+  } catch (e) {
+    devDiag.sharp = 'skip: ' + (e && e.message ? e.message : e);
+  }
+  return canvas;
+}
+
 /* ---------- 水平仪 ----------
    旧版只读 gamma，那只在竖屏成立。横屏时手机的「左右」对应 beta，
    所以一转屏就彻底失准 —— 这就是「不会自适应横屏」。
@@ -1171,6 +1202,12 @@ function renderDiag() {
       (devDiag.via && devDiag.via.indexOf('video') >= 0 ? 'bad' : '') + '">' +
       (devDiag.via || '—') + (devDiag.raw ? ' · ' + devDiag.raw : '') + '</b></div>' +
     '<div><span>成片</span><b>' + (devDiag.out || '—') + '</b></div>' +
+    '<div><span>对焦</span><b>' + (devDiag.af || '—') + '</b></div>' +
+    '<div><span>锐化</span><b>' +
+      (devDiag.sharp == null ? '—'
+        : (typeof devDiag.sharp === 'string' ? devDiag.sharp
+          : '强度 ' + devDiag.sharp.amount + ' / ' +
+            (devDiag.sharp.px / 1e6).toFixed(1) + 'MP')) + '</b></div>' +
     '<div><span>影调</span><b>' + toneTxt + '</b></div>';
 }
 
@@ -1320,37 +1357,192 @@ async function warmUp(frames) {
   for (let i = 0; i < n; i++) await nextFrame();
 }
 
-async function grabBestImage() {
-  await warmUp(3);
+/* ---------------- 成像：对焦收敛 → 连续抓帧 → 择优 ----------------
 
-  // ① ImageCapture：拿到的是传感器满分辨率原图，画质最好
+   之前的实现是 warmUp(3) 之后抓 3 帧，帧间隔 80ms，总共不到 250ms。
+   问题是：continuous 对焦模式下，按下快门那一刻镜头经常正在来回拉，
+   抓到的是「行程中」的帧 —— 所以同样的场景，有时清楚有时糊。
+   用户说的「不稳定」就是这个。
+
+   现在分三步：
+   1. 先丢一次单次对焦指令，把镜头从「持续搜索」切到「打一次靶」；
+   2. 每 ~90ms 抓一帧并算 ROI 拉普拉斯方差，最多等 700ms，
+      分数连续两帧不再上涨就提前收工（AF 收敛通常 150~450ms）；
+   3. 在候选里挑分数最高的一帧，不是「最后一帧」。
+   ------------------------------------------------------------ */
+
+/* 触发一次单次对焦。连续对焦的镜头在快门瞬间往往正在移动，必须先叫停。 */
+async function kickFocusOnce(track) {
+  if (!track || !track.applyConstraints) return false;
+  const modes = (caps && caps.focusMode) || [];
+  const one = modes.includes('single-shot') ? 'single-shot'
+    : (modes.includes('auto') ? 'auto' : null);
+  if (!one) return false;
+  try {
+    await track.applyConstraints({ advanced: [{ focusMode: one }] });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/* 等对焦收敛，返回这段时间里最清晰的一帧 */
+async function focusBurst(track, opts) {
+  const o = opts || {};
+  const budget = o.budget == null ? 700 : o.budget;
+  const gap = o.gap == null ? 90 : o.gap;
+  const minFrames = o.minFrames || 3;
+
+  const kicked = await kickFocusOnce(track);
+  const t0 = performance.now();
+  const scores = [];
+  let stall = 0, lastScore = -1, bestScore = -1, bestQ = null, bestCanvas = null;
+
+  while (true) {
+    await nextFrame();
+    const c = grabFrame();
+    const q = frameQuality(c);
+    // 只留最好的那张。12MP 一帧占 48MB，连留五帧在手机上直接 OOM；
+    // 被淘汰的路人要立刻释放后备存储，不能等 GC。
+    if (q.score > bestScore) {
+      if (bestCanvas) { bestCanvas.width = 0; bestCanvas.height = 0; }
+      bestScore = q.score; bestCanvas = c; bestQ = q;
+    } else {
+      c.width = 0; c.height = 0;
+    }
+    scores.push(q.score);
+
+    // 分数已经封顶且不再上涨，就不必把 700ms 等满
+    if (scores.length >= minFrames) {
+      if (lastScore > 0 && q.score <= lastScore * 1.02) stall++;
+      else stall = 0;
+      if (stall >= 2) break;
+    }
+    lastScore = q.score;
+    if (performance.now() - t0 >= budget) break;
+    await sleep(gap);
+  }
+
+  return {
+    canvas: bestCanvas,
+    q: bestQ || { score: 0, stats: null },
+    frames: scores.length,
+    score: bestScore,
+    ms: Math.round(performance.now() - t0),
+    focused: kicked
+  };
+}
+
+/* 把采集分辨率临时推到最高再抓帧。
+   Android WebView 的 ImageCapture.takePhoto() 在多数机型上只是把当前视频轨
+   快照一份，分辨率等于预览流（我们实测输出 1920×1440），拿不到传感器满幅。
+   真正的高分辨率只有一条路：重新协商约束，让采集管线按更大的档位出帧。
+   抓完立刻恢复预览档位 —— 大分辨率下帧率会掉，不能一直留着。 */
+async function grabHiRes(track) {
+  if (!track || !track.applyConstraints) return null;
+  const capW = (caps.width && caps.width.max) || 0;
+  const capH = (caps.height && caps.height.max) || 0;
+  if (!capW || !capH) return null;
+
+  const curW = video.videoWidth || 0, curH = video.videoHeight || 0;
+  // 上限压到 3000 高：再大 WebView 的预览输出多半不支持，协商失败反而更糟
+  const wantH = Math.min(capH, 3000);
+  const wantW = Math.min(capW, Math.round(wantH * 4 / 3));
+  // 提不上 20% 就没意义，别为几万像素折腾一次黑屏
+  if (wantW < curW * 1.2) return null;
+
+  const prev = streamConstraint();
+  const restore = async () => {
+    try {
+      await track.applyConstraints({
+        width: { ideal: prev.width.ideal },
+        height: { ideal: prev.height.ideal },
+        frameRate: { ideal: prev.frameRate.ideal }
+      });
+    } catch (e) {}
+    applyVideoTransform();
+    layoutStage();
+  };
+
+  try {
+    // 切换分辨率会让预览黑一下，先把当前这一帧（含水印）抓成静态帧盖住，
+    // 快门按下后画面才不会「闪黑 → 复亮」
+    try { grabPoster(); } catch (e) {}
+    setLive(false);
+    await track.applyConstraints({
+      width: { ideal: wantW },
+      height: { ideal: wantH }
+    });
+    // 等 videoWidth 真的变了，最多 900ms
+    const t0 = performance.now();
+    let ok = false;
+    while (performance.now() - t0 < 900) {
+      await nextFrame();
+      if (video.videoWidth >= curW * 1.2) { ok = true; break; }
+    }
+    if (!ok) return null;
+
+    // 分辨率变了，AF 要重新走一遍，这里用短一点的窗口
+    const r = await focusBurst(track, { budget: 380, gap: 80, minFrames: 2 });
+    r.hiRes = video.videoWidth + 'x' + video.videoHeight;
+    return r;
+  } catch (e) {
+    return null;
+  } finally {
+    await restore();
+    setLive(true);
+  }
+}
+
+async function grabBestImage() {
+  await warmUp(2);
+
+  // ① ImageCapture：若能拿到明显大于预览流的位图，说明是真·传感器满幅，
+  //    直接用。否则它只是视频轨快照，跟抓帧没有区别，还可能更慢。
   if (imageCapture && S.quality === 'high' && typeof imageCapture.takePhoto === 'function') {
     try {
       const blob = await imageCapture.takePhoto();
       const bmp = await createImageBitmap(blob);
-      return { src: bmp, w: bmp.width, h: bmp.height, via: 'capture', score: 0, stats: statsOf(bmp) };
+      const curW = video.videoWidth || 0, curH = video.videoHeight || 0;
+      // 两个条件都要满足才算「真满幅」：
+      //   ① 宽高都明显大于预览流（只大一点点的是同一条轨的快照）；
+      //   ② 宽高比和预览流接近 —— 有些机型会交一张 16:9 的裁切图，
+      //      横向更宽但上下被剪掉，用它反而丢掉画面。
+      const bigger = bmp.width >= Math.max(1, curW) * 1.25 &&
+        bmp.height >= Math.max(1, curH) * 1.25;
+      const sameAspect = curW && curH
+        ? Math.abs((bmp.width / bmp.height) - (curW / curH)) < 0.12
+        : true;
+      if (bigger && sameAspect) {
+        return { src: bmp, w: bmp.width, h: bmp.height, via: 'capture', score: 0, stats: statsOf(bmp) };
+      }
+      // 尺寸和预览流一样，或者比例被裁过 —— 不是满幅，丢掉，走下面的高分辨率路径
+      try { bmp.close && bmp.close(); } catch (e) {}
     } catch (e) {
       // 部分 WebView / 机型不支持，静默降级
     }
   }
 
-  // ② 预览帧：取多帧后择优。帧间要留出间隔，
-  //    紧挨着的两帧几乎一样，抓不到手抖和对焦拉风箱带来的差异。
-  const n = S.smartPick ? 3 : 1;
-  const cands = [];
-  for (let i = 0; i < n; i++) {
-    await nextFrame();
-    if (i) await sleep(80);
-    const f = grabFrame();
-    cands.push({ canvas: f, q: frameQuality(f) });
+  // ② 原生满幅：临时把约束推到最大，抓完恢复
+  if (S.quality === 'high') {
+    const hi = await grabHiRes(trackRef);
+    if (hi) {
+      return {
+        src: hi.canvas, w: hi.canvas.width, h: hi.canvas.height,
+        via: 'hires', score: hi.score, stats: hi.q.stats,
+        frames: hi.frames, afMs: hi.ms
+      };
+    }
   }
-  const idx = Math.max(0, WMImg.selectBest(cands.map(c => ({
-    score: c.q.score, blown: c.q.stats ? c.q.stats.blown : 0
-  }))));
-  const pick = cands[idx];
+
+  // ③ 预览帧：等对焦收敛后择优
+  const b = await focusBurst(trackRef, S.smartPick
+    ? { budget: 700, gap: 90, minFrames: 3 }
+    : { budget: 120, gap: 60, minFrames: 2 });
   return {
-    src: pick.canvas, w: pick.canvas.width, h: pick.canvas.height,
-    via: 'video', score: pick.q.score, stats: pick.q.stats, cands: cands.length
+    src: b.canvas, w: b.canvas.width, h: b.canvas.height,
+    via: 'video', score: b.score, stats: b.q.stats,
+    frames: b.frames, afMs: b.ms
   };
 }
 
@@ -1636,7 +1828,11 @@ async function capture() {
     const canvas = composeCanvas(raw);
     lastRaw = cloneCanvas(canvas);   // 未套影调的构图，改水印时重算
     devDiag.out = canvas.width + 'x' + canvas.height;
+    devDiag.af = raw.afMs != null
+      ? (raw.afMs + 'ms / ' + (raw.frames || 1) + '帧')
+      : (raw.via === 'capture' ? '原生满幅' : '—');
     applyToneLut(canvas);
+    sharpenCanvas(canvas, raw);
     renderDiag();
     lastBase = base;
 
