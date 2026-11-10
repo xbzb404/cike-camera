@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.4.1';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -34,7 +34,9 @@ const DEFAULTS = {
   place: '',
   amapKey: '',
   style: 'classic',
-  pos: 'bottom',        // bottom | br | top
+  pos: 'bl',            // bl | br | tl | tr（左下/右下/左上/右上）
+  autoPos: true,        // 横屏时自动把水印挪到空着的角落
+  size: '1080',         // 预览流长边：720 | 1080 | 1440
   wmScale: 1,           // 0.85 | 1 | 1.15
   autoInk: true,        // 按底图亮度自动切深/浅墨水
   fields: [],           // 自定义字段 [{k,v}]
@@ -79,8 +81,13 @@ function readSettings() {
   if ((s.title || '').trim() === '水印相机') s.title = DEFAULTS.title;
   if (!WM.STYLES.some(x => x.id === s.style)) s.style = DEFAULTS.style;
   if (!Array.isArray(s.fields)) s.fields = [];
-  if (!['bottom', 'br', 'top'].includes(s.pos)) s.pos = 'bottom';
-  if (![0, 3, 10].includes(Number(s.timer))) s.timer = 0;
+  // 位置从两段式（bottom/br/top）扩成四角，旧值做等价映射
+  const POS_MAP = { bottom: 'bl', top: 'tl' };
+  if (POS_MAP[s.pos]) s.pos = POS_MAP[s.pos];
+  if (!['bl', 'br', 'tl', 'tr'].includes(s.pos)) s.pos = 'bl';
+  if (!['720', '1080', '1440'].includes(String(s.size))) s.size = '1080';
+  // 老用户的设置里没有这个字段，必须显式补 true，否则 Object.assign 之后是 undefined
+  if (typeof s.autoPos !== 'boolean') s.autoPos = true;
   return s;
 }
 
@@ -151,17 +158,55 @@ function stopStream() {
   }
   trackRef = null;
   imageCapture = null;
+  // 必须解绑：留着已经结束的 srcObject，video 会一直显示最后一帧（或全黑），
+  // 用户看到的就是「卡住」，而按快门抓到的正是这张死帧。
+  try { video.pause(); } catch (e) {}
+  try { video.srcObject = null; } catch (e) {}
 }
 
-function qualityConstraint() {
-  return S.quality === 'high'
-    ? { width: { ideal: 2560 }, height: { ideal: 1920 } }
-    : { width: { ideal: 1920 }, height: { ideal: 1440 } };
+/* 重开一路流。设备 id 可能已经轮换（例如外接摄像头被拔掉），失败就退回默认镜头 */
+async function restartCamera() {
+  stopStream();
+  await sleep(80);
+  lastLand = isLandscape();
+  let ok = false;
+  if (curDeviceId) ok = await startCamera(curDeviceId);
+  if (!ok) ok = await startCamera(null);
+  return ok;
 }
+
+/* 预览流约束。
+   ------------------------------------------------------------
+   旧值请求 2560×1920（4:3 横向），WebView 实际回的是 1920×2560 —— 4.9MP 的流。
+   这个尺寸 Android WebView 推不到 30fps，而且掉帧之后每一帧的曝光积分时间被拉长，
+   于是三个症状一起出现：卡（帧率低）、糊（长时间曝光带来运动模糊）、
+   发白（同一场景下更长的积分 = 更高的平均亮度）。
+   原生相机的做法本来就是「预览用低分辨率保流畅，拍照走满幅」，这里照做。 */
+function streamConstraint() {
+  const longEdge = Number(S.size) || 1080;
+  const land = isLandscape();
+  // 长边取用户所选，短边按 3:4 折算（与手机竖握时传感器的裁切比例一致）
+  const w = land ? longEdge : Math.round(longEdge * 3 / 4);
+  const h = land ? Math.round(longEdge * 3 / 4) : longEdge;
+  return {
+    width: { ideal: w },
+    height: { ideal: h },
+    aspectRatio: { ideal: w / h },
+    frameRate: { ideal: 30 }
+  };
+}
+
+/* 打开相机可能被多处同时触发：启动、切前后摄、改尺寸、从后台回来。
+   并发时后一次 getUserMedia 会和前一次抢同一个摄像头，表现就是「卡住不动」。
+   用一个代次号把过期的启动请求全部作废。 */
+let startSeq = 0;
+let camStarting = false;
 
 async function startCamera(deviceId, opts) {
   const keepLenses = !!(opts && opts.keepLenses);
   if (typeof deviceId !== 'string') deviceId = null;
+  const seq = ++startSeq;
+  camStarting = true;
   hideGuard();
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -171,11 +216,17 @@ async function startCamera(deviceId, opts) {
 
   stopStream();
   try {
-    const video0 = Object.assign({}, qualityConstraint());
+    const video0 = Object.assign({}, streamConstraint());
     if (deviceId) video0.deviceId = { exact: deviceId };
     else video0.facingMode = { ideal: facing };
 
-    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: video0 });
+    const got = await navigator.mediaDevices.getUserMedia({ audio: false, video: video0 });
+    if (seq !== startSeq) {
+      // 期间又有人发起了新的启动，这次的流直接扔掉，否则两路流会打架
+      got.getTracks().forEach(t => t.stop());
+      return false;
+    }
+    stream = got;
     const track = stream.getVideoTracks()[0];
     trackRef = track;
     const st = (track.getSettings && track.getSettings()) || {};
@@ -198,8 +249,10 @@ async function startCamera(deviceId, opts) {
     await setupZoom(track);
 
     updateToolCaps();
+    camStarting = false;
     return true;
   } catch (err) {
+    camStarting = false;
     const name = (err && err.name) || '';
     if (name === 'NotAllowedError' || name === 'SecurityError') {
       showGuard('相机权限被拒绝。请在系统设置或浏览器权限里允许「相机」，然后点重试。', '重试');
@@ -462,6 +515,17 @@ function layoutStage() {
 
 let uiCode = '';
 
+function isTopPos(p) { return p === 'top' || p === 'tl' || p === 'tr'; }
+function isRightPos(p) { return p === 'br' || p === 'tr'; }
+
+/* 水印最终落点。
+   横屏时画面变成宽幅，左下角被底部控制条压住、左上角被工具条压住，
+   右上角是唯一干净的角落 —— 手机横过来就自动挪过去，竖回去再挪回用户选的位置。 */
+function effPos() {
+  if (!S.autoPos) return S.pos;
+  return isLandscape() ? 'tr' : S.pos;
+}
+
 function renderOverlay() {
   const W = stage.clientWidth;
   const H = stage.clientHeight;
@@ -482,11 +546,12 @@ function renderOverlay() {
 
   const d = WM.buildData(displayBase(liveBase()), S, uiCode);
   // 取景器里底图就是视频，亮度直接从 video 采样
+  const pos = effPos();
   let ink = 'dark';
   if (S.autoInk) {
-    try { ink = sampleVideoInk(S.pos); } catch (e) { ink = 'dark'; }
+    try { ink = sampleVideoInk(pos); } catch (e) { ink = 'dark'; }
   }
-  WM.draw(ctx, W, H, d, { style: S.style, pos: S.pos, scale: S.wmScale, ink, s: S });
+  WM.draw(ctx, W, H, d, { style: S.style, pos, scale: S.wmScale, ink, s: S });
 }
 
 let inkCanvas = null;
@@ -498,10 +563,12 @@ function sampleVideoInk(pos) {
     inkCanvas.height = 16;
   }
   const c = inkCanvas.getContext('2d', { willReadFrequently: true });
-  // 与水印区域对应的源区域
-  const bandH = Math.round(video.videoHeight * 0.34);
-  const sy = pos === 'top' ? 0 : video.videoHeight - bandH;
-  c.drawImage(video, 0, sy, video.videoWidth, bandH, 0, 0, 24, 16);
+  // 与水印区域对应的源区域：按落点取对应的那个角，而不是永远取整条横带
+  const bw = Math.round(video.videoWidth * 0.62);
+  const bh = Math.round(video.videoHeight * 0.34);
+  const sx = isRightPos(pos) ? video.videoWidth - bw : 0;
+  const sy = isTopPos(pos) ? 0 : video.videoHeight - bh;
+  c.drawImage(video, sx, sy, bw, bh, 0, 0, 24, 16);
   const px = c.getImageData(0, 0, 24, 16).data;
   let sum = 0;
   for (let i = 0; i < px.length; i += 4) sum += 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
@@ -553,14 +620,25 @@ function toneActive() {
   return !!(window.WMCTone && (S.autoTone || Math.abs(manualExposure()) > 0.005));
 }
 
-/* 取景预览：CSS filter 只能近似「去灰」那一段，做不了查表。
-   这里刻意不做全局压暗 —— 那正是之前把画面压成灰雾的原因。 */
+/* 取景预览的滤镜。
+   ------------------------------------------------------------
+   这里原先是无条件给 video 挂 CSS filter。对一个 1920×2560 的视频层
+   每帧都跑一遍 GPU 滤镜通道，代价极高 —— 这是「刷新率极低」的第二大来源
+   （第一是预览流本身分辨率太高）。
+   只有用户手动拉过亮度滑块时才挂滤镜（那时确实需要所见即所得），
+   自动影调只作用于成片，预览保持摄像头原始画面。 */
 function toneFilter() {
-  return tone.preview || 'none';
+  if (!window.WMCTone) return 'none';
+  if (Math.abs(manualExposure()) < 0.005) return 'none';
+  return WMCTone.previewFilter(tone.lut) || 'none';
 }
 
+let appliedFilter = 'none';
 function applyToneToPreview() {
-  video.style.filter = toneFilter();
+  const want = toneFilter();
+  if (want === appliedFilter) return;      // 不重复写 style，避免触发重排
+  appliedFilter = want;
+  video.style.filter = want;
 }
 
 /* 从取景器采样，按分位生成查找表；变化足够大才更新，避免忽明忽暗 */
@@ -685,7 +763,9 @@ function stopToneLoop() {
   if (toneTimer) { clearInterval(toneTimer); toneTimer = 0; }
 }
 
-async function refreshUiCode() {  try {
+async function refreshUiCode() {
+  if (document.hidden) return;      // 后台不做无谓的签名
+  try {
     const pub = await WMC.getPublic();
     const b = liveBase();
     const core = { v: 1, kid: pub.kid, ts: b.time.toISOString(), lat: b.lat, lng: b.lng, src: b.src, addr: b.addr || '' };
@@ -1034,6 +1114,27 @@ function shutterFlash() {
 }
 
 
+/* 抓一帧算平均亮度，用来判断这是不是一张全黑的死帧。
+   切后台回来、或刚重新开流时，video 常常还是黑的，这时候出片就是纯黑照片。 */
+function frameMean(src) {
+  if (!src) return -1;
+  try {
+    const c = document.createElement('canvas');
+    c.width = 48;
+    c.height = 48;
+    const x = c.getContext('2d', { willReadFrequently: true });
+    x.drawImage(src, 0, 0, 48, 48);
+    const d = x.getImageData(0, 0, 48, 48).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    }
+    return sum / (d.length / 4);
+  } catch (e) {
+    return -1;   // 读不到就不拦，宁可放行也不要卡住拍摄
+  }
+}
+
 async function capture() {
   if (busy) return;
   if (!video.videoWidth) { toast('相机还没准备好'); return; }
@@ -1046,6 +1147,23 @@ async function capture() {
     showBusy('正在成像…');
 
     let raw = await grabBestImage();
+
+    // 全黑保护：轨道失效时 grabBestImage 会抓到一张全黑帧，
+    // 不拦住就会「点了能拍，但照片全黑」。这里自动重开一次摄像头再抓。
+    let mean = frameMean(raw.src);
+    if (mean >= 0 && mean < 3.5) {
+      devDiag.via = '全黑·重开摄像头';
+      renderDiag();
+      await restartCamera();
+      await sleep(260);
+      raw = await grabBestImage();
+      mean = frameMean(raw.src);
+      if (mean >= 0 && mean < 3.5) {
+        toast('摄像头没有画面，已重新打开，请再按一次');
+        return;
+      }
+    }
+
     devDiag.via = raw.via || '?';
     devDiag.raw = raw.w + 'x' + raw.h;
 
@@ -1522,7 +1640,7 @@ function paintStyleThumbs() {
   const d = WM.buildData(displayBase(liveBase()), S, uiCode);
   let ink = 'dark';
   if (S.autoInk) {
-    try { ink = WM.measureInk(base.getContext('2d'), bw, bh, S.pos === 'top' ? 'top' : 'bottom'); } catch (e) {}
+    try { ink = WM.measureInk(base.getContext('2d'), bw, bh, effPos()); } catch (e) {}
   }
   grid.querySelectorAll('.style-item').forEach(item => {
     const c = item.querySelector('canvas');
@@ -1530,7 +1648,7 @@ function paintStyleThumbs() {
     ctx.clearRect(0, 0, c.width, c.height);
     ctx.drawImage(base, 0, 0, c.width, c.height);
     WM.draw(ctx, c.width, c.height, d, {
-      style: item.dataset.style, pos: S.pos, scale: S.wmScale, ink, s: S
+      style: item.dataset.style, pos: effPos(), scale: S.wmScale, ink, s: S
     });
     item.classList.toggle('on', item.dataset.style === S.style);
   });
@@ -1561,7 +1679,7 @@ function syncUI() {
     swCoords: 'showCoords', swWeather: 'showWeather', swCode: 'showCode',
     swGcj: 'coordGcj', swAlt: 'showAltitude', swAcc: 'showAccuracy',
     swInk: 'autoInk', swExif: 'writeExif', swSmart: 'smartPick', swGrid: 'grid',
-    swTone: 'autoTone'
+    swTone: 'autoTone', swAutoPos: 'autoPos'
   };
   for (const id in map) {
     const el = document.getElementById(id);
@@ -1581,6 +1699,7 @@ function syncUI() {
   setSeg('segPos', S.pos);
   setSeg('segScale', String(S.wmScale));
   setSeg('segQuality', S.quality);
+  setSeg('segSize', String(S.size));
   setSeg('segCoord', S.coordFmt);
 
   $$('.style-item').forEach(it => it.classList.toggle('on', it.dataset.style === S.style));
@@ -1718,6 +1837,7 @@ function bindUI() {
     ['segPos', v => { S.pos = v; }],
     ['segScale', v => { S.wmScale = Number(v); }],
     ['segQuality', v => { S.quality = v; }],
+    ['segSize', v => { S.size = v; }],
     ['segCoord', v => { S.coordFmt = v; }]
   ];
   segs.forEach(([id, apply]) => {
@@ -1730,7 +1850,7 @@ function bindUI() {
       saveSettings();
       syncUI();
       renderOverlay();
-      if (id === 'segQuality') startCamera(curDeviceId, { keepLenses: true });
+      if (id === 'segQuality' || id === 'segSize') startCamera(curDeviceId, { keepLenses: true });
     });
   });
 
@@ -1854,7 +1974,6 @@ function boot() {
   bindUI();
   syncUI();
   initLevel();
-  initLevel();
   initGeo();
   startCamera();
   setInterval(renderOverlay, 1000);
@@ -1868,6 +1987,63 @@ function boot() {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
 }
+
+/* ---------- 生命周期 ----------
+   之前完全没有处理「切后台 / 锁屏 / 换页」：WebView 只是把页面挂起，
+   摄像头轨道被系统掐掉，回来时 video 还挂着已经失效的 srcObject。
+   用户看到的就是「退出或切换页面后再打开会卡住」，而按快门抓到的是全黑死帧。
+   现在隐藏时主动关流，回到前台重新开流。 */
+let resuming = false;
+
+function camSleep() {
+  stopStream();
+  try { video.srcObject = null; } catch (e) {}
+}
+
+async function camWake() {
+  if (resuming || camStarting) return;
+  if (video.srcObject && video.readyState >= 2) return;
+  resuming = true;
+  try {
+    await restartCamera();
+    layoutStage();
+    renderOverlay();
+  } finally {
+    resuming = false;
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) camSleep();
+  else camWake();
+});
+window.addEventListener('pagehide', camSleep);
+window.addEventListener('pageshow', () => { if (!document.hidden) camWake(); });
+
+/* ---------- 转屏 ----------
+   横竖屏切换后要做三件事：重算取景框尺寸、按新方向重摆水印、
+   按新方向重开一路分辨率合适的流（否则横屏还拿着竖屏的 3:4 流，画面只占中间一条）。 */
+let lastLand = isLandscape();
+let orientTimer = 0;
+
+function onOrientation() {
+  const land = isLandscape();
+  const flipped = land !== lastLand;
+  lastLand = land;
+  layoutStage();
+  renderOverlay();
+  if (!flipped) return;
+
+  clearTimeout(orientTimer);
+  orientTimer = setTimeout(() => {
+    if (camStarting || resuming || busy) return;
+    if (!video.srcObject) return;
+    startCamera(curDeviceId, { keepLenses: true });
+  }, 420);
+}
+
+window.addEventListener('orientationchange', onOrientation);
+window.addEventListener('resize', onOrientation);
 
 video.addEventListener('loadedmetadata', layoutStage);
 video.addEventListener('resize', layoutStage);

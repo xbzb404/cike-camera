@@ -83,7 +83,8 @@ const SIZES = [
   { W: 4000, H: 3000, name: '12MP' },
   { W: 420, H: 560, name: '缩略图' }
 ];
-const POS = ['bottom', 'br', 'top'];
+// 四个角都要过：横屏会自动把水印挪到右上（tr），旧值 bottom/top 保留为别名
+const POS = ['bl', 'br', 'tl', 'tr', 'bottom', 'top'];
 const SCALES = [0.85, 1, 1.15];
 
 let fail = 0;

@@ -163,6 +163,74 @@ const LNG = 121.473701;
   });
   ok('连续两次「改水印」结果一致（未叠加）', hashes[0] === hashes[1], hashes.join(' / '));
 
+  /* ---------- 生命周期：切后台关流、回前台重开 ---------- */
+  const life = await page.evaluate(async () => {
+    const v = document.querySelector('video');
+    const before = !!v.srcObject;
+
+    // 模拟切到后台
+    Object.defineProperty(document, 'hidden', { value: true, configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await new Promise(r => setTimeout(r, 200));
+    const slept = { hasStream: !!v.srcObject, paused: v.paused };
+
+    // 模拟回到前台
+    Object.defineProperty(document, 'hidden', { value: false, configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await new Promise(r => setTimeout(r, 1600));
+    const woke = {
+      hasStream: !!v.srcObject,
+      ready: v.readyState,
+      w: v.videoWidth, h: v.videoHeight,
+      paused: v.paused
+    };
+    return { before, slept, woke };
+  });
+  ok('切后台前有视频流', life.before);
+  ok('切后台后主动关流（不留失效帧）', !life.slept.hasStream && life.slept.paused);
+  ok('回到前台自动重开并有画面', life.woke.hasStream && life.woke.ready >= 2 && life.woke.w > 0,
+    life.woke.w + 'x' + life.woke.h + ' ready=' + life.woke.ready);
+
+  /* ---------- 全黑帧会被拦下 ---------- */
+  const black = await page.evaluate(() => {
+    const c = document.createElement('canvas');
+    c.width = 64; c.height = 64;
+    const x = c.getContext('2d');
+    x.fillStyle = '#000'; x.fillRect(0, 0, 64, 64);
+    const blackMean = frameMean(c);
+    x.fillStyle = '#808080'; x.fillRect(0, 0, 64, 64);
+    return { blackMean, greyMean: frameMean(c) };
+  });
+  ok('全黑帧均值接近 0（会触发重开摄像头）', black.blackMean < 3.5, String(black.blackMean.toFixed(2)));
+  ok('正常帧不会被误判成黑屏', black.greyMean > 100, String(black.greyMean.toFixed(1)));
+
+  /* ---------- 竖屏：水印用用户选的位置 ---------- */
+  const port = await page.evaluate(() => {
+    const on = document.querySelector('#segPos button.on');
+    return { portrait: !isLandscape(), eff: effPos(), chosen: on ? on.dataset.v : null };
+  });
+  ok('竖屏时水印用用户选的位置', port.portrait && port.eff === port.chosen,
+    port.eff + ' / 选中 ' + port.chosen);
+
+  /* ---------- 横屏：水印自动挪到右上，避开工具条与快门 ---------- */
+  await page.setViewportSize({ width: 900, height: 420 });
+  await page.waitForTimeout(300);
+  const lscape = await page.evaluate(() => ({
+    land: isLandscape(),
+    eff: effPos(),
+    auto: document.getElementById('swAutoPos').checked,
+    stage: (() => {
+      const r = document.getElementById('stage').getBoundingClientRect();
+      return Math.round(r.width) + 'x' + Math.round(r.height);
+    })()
+  }));
+  ok('横屏判定生效', lscape.land, 'stage ' + lscape.stage);
+  ok('横屏时水印自动挪到右上', lscape.land && lscape.eff === 'tr', lscape.eff + ' auto=' + lscape.auto);
+  await page.setViewportSize({ width: 430, height: 920 });
+  await page.waitForTimeout(300);
+  const back = await page.evaluate(() => ({ portrait: !isLandscape(), eff: effPos() }));
+  ok('转回竖屏后水印回到原位', back.portrait && back.eff === port.chosen, back.eff);
+
   /* ---------- 验真页闭环 ---------- */
   const vp = await ctx.newPage();
   const vErr = [];

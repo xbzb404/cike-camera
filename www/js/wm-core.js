@@ -108,10 +108,18 @@
     return sum / (px.length / 4) / 255;
   }
 
+  /* ---------------- 位置 ----------------
+     旧实现只有 'top' 和 'br' 两个特例，其余一律当左下，
+     所以竖屏够用，一横屏就没有可用位置。
+     这里把位置拆成「上/下」×「左/右」两个正交维度：
+       bl / br / tl / tr   （bottom / top 作为旧值保留为 bl / tl） */
+  function posTop(p) { return p === 'top' || p === 'tl' || p === 'tr'; }
+  function posRight(p) { return p === 'br' || p === 'tr'; }
+
   /* 水印所在区域的亮度 → 决定用深墨还是浅墨 */
   function measureInk(ctx, W, H, pos) {
     const bandH = Math.round(H * 0.34);
-    const y = (pos === 'top') ? 0 : H - bandH;
+    const y = posTop(pos) ? 0 : H - bandH;
     const l = meanLuma(ctx, 0, y, W, bandH);
     // 主观阈值：画面偏亮就用深字，否则白字
     return l > 0.62 ? 'light' : 'dark';
@@ -198,7 +206,7 @@
 
   /* 垂直锚点：pos = top | bottom（右下/左下在水平方向另算） */
   function anchorY(H, contentH, padY, pos) {
-    return pos === 'top' ? padY : H - padY - contentH;
+    return posTop(pos) ? padY : H - padY - contentH;
   }
 
   /* ---------------- 样式：经典左竖条 ---------------- */
@@ -208,10 +216,10 @@
     if (!L.length) return;
     const padX = 54 * s, padY = 62 * s;
     const totalH = blockHeight(L);
-    const right = o.pos === 'br';
+    const right = posRight(o.pos);
     const textX = right ? null : padX + 28 * s;
     const maxW = W - padX - 54 * s - 28 * s;
-    let y = anchorY(H, totalH, padY, o.pos === 'top' ? 'top' : 'bottom');
+    let y = anchorY(H, totalH, padY, o.pos);
 
     ctx.save();
     const barX = right ? W - padX - 7 * s : padX;
@@ -259,8 +267,8 @@
     }
     const boxW = Math.min(maxTextW + inner * 2, W - 88 * s);
     const boxH = totalH - lastGap + inner * 2;
-    const x = (o.pos === 'br') ? W - 44 * s - boxW : 44 * s;
-    const y = anchorY(H, boxH, 48 * s, o.pos === 'top' ? 'top' : 'bottom');
+    const x = (posRight(o.pos)) ? W - 44 * s - boxW : 44 * s;
+    const y = anchorY(H, boxH, 48 * s, o.pos);
 
     ctx.save();
     roundRect(ctx, x, y, boxW, boxH, 24 * s);
@@ -304,14 +312,14 @@
     const padX = 56 * s, padY = 64 * s;
     const totalH = blockHeight(L);
     const maxW = W - padX * 2;
-    let y = anchorY(H, totalH, padY, o.pos === 'top' ? 'top' : 'bottom');
+    let y = anchorY(H, totalH, padY, o.pos);
 
     ctx.textBaseline = 'top';
-    ctx.textAlign = o.pos === 'br' ? 'right' : 'left';
+    ctx.textAlign = posRight(o.pos) ? 'right' : 'left';
     ctx.shadowColor = P.shadow;
     ctx.shadowBlur = 14 * s;
     ctx.shadowOffsetY = 2 * s;
-    const tx = o.pos === 'br' ? W - padX : padX;
+    const tx = posRight(o.pos) ? W - padX : padX;
     for (const l of L) {
       setFont(ctx, l.size, l.weight);
       ctx.fillStyle = colorOf(l, P);
@@ -350,7 +358,7 @@
     for (const l of R) rightH += l.size * 1.3 + l.gap;
     const leftH = (S.showTime ? timeSize * 0.98 + 14 * s + dateSize * 1.2 : 0);
     const blockH = Math.max(leftH, rightH);
-    const top = anchorY(H, blockH, padY, o.pos === 'top' ? 'top' : 'bottom');
+    const top = anchorY(H, blockH, padY, o.pos);
 
     ctx.textBaseline = 'top';
     ctx.shadowColor = P.shadow;
@@ -423,7 +431,7 @@
 
     const rTotal = rLines.reduce((h, l) => h + l.size * 1.34, 0);
     const boxH = Math.max(156 * sc * s, rTotal + 56 * s, 132 * s);
-    const y = anchorY(H, boxH, 44 * s, o.pos === 'top' ? 'top' : 'bottom');
+    const y = anchorY(H, boxH, 44 * s, o.pos);
 
     ctx.save();
     roundRect(ctx, padX, y, boxW, boxH, 24 * s);
@@ -512,9 +520,9 @@
     if (!L.length) return;
 
     const totalH = blockHeight(L);
-    const right = o.pos !== 'bl';
-    const endY = o.pos === 'top' ? padY : H - padY;
-    let y = o.pos === 'top' ? padY : endY - totalH;
+    const right = posRight(o.pos);
+    const endY = posTop(o.pos) ? padY : H - padY;
+    let y = posTop(o.pos) ? padY : endY - totalH;
 
     ctx.textAlign = right ? 'right' : 'left';
     ctx.textBaseline = 'top';
@@ -531,7 +539,7 @@
     ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0;
 
     ctx.fillStyle = P.ink === 'light' ? 'rgba(16,20,28,.35)' : 'rgba(255,255,255,.45)';
-    const lineY = o.pos === 'top' ? y + 14 * s : y - totalH - 22 * s;
+    const lineY = posTop(o.pos) ? y + 14 * s : y - totalH - 22 * s;
     ctx.fillRect(right ? W - padX - 46 * s : padX, lineY, 46 * s, Math.max(1.5, 2.4 * s));
     ctx.textAlign = 'left';
   }
@@ -566,7 +574,7 @@
     const boxH = innerY * 2 + h1 + (L2.length ? gapV + h2 : 0);
 
     // 标签固定贴在顶部两角（位置设置只决定左上还是右上）
-    const x = o.pos === 'br' ? W - pad - boxW : pad;
+    const x = posRight(o.pos) ? W - pad - boxW : pad;
     const y = pad;
 
     ctx.save();
@@ -632,9 +640,9 @@
     const restH = lines.reduce((a, l) => a + l.size * 1.3, 0);
     const boxH = padY * 2 + bigH + (lines.length ? 8 * s + restH : 0);
 
-    const right = o.pos !== 'bl';
+    const right = posRight(o.pos);
     const x = right ? W - pad - boxW : pad;
-    const y = anchorY(H, boxH, pad, o.pos === 'top' ? 'top' : 'bottom');
+    const y = anchorY(H, boxH, pad, o.pos);
 
     ctx.save();
     roundRect(ctx, x, y, boxW, boxH, 18 * s);

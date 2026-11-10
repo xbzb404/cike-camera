@@ -169,9 +169,10 @@
     <div class="field">
       <span class="field-label">位置</span>
       <div class="seg" id="segPos">
-        <button data-v="bottom">左下</button>
+        <button data-v="bl">左下</button>
         <button data-v="br">右下</button>
-        <button data-v="top">顶部</button>
+        <button data-v="tl">左上</button>
+        <button data-v="tr">右上</button>
       </div>
     </div>
     <div class="field">
@@ -184,6 +185,7 @@
     </div>
     <div class="switch-list">
       <label class="switch-item"><span>自动取色（按底图明暗切换黑白墨水）</span><input type="checkbox" id="swInk"><i></i></label>
+      <label class="switch-item"><span>横屏自动挪到右上（避开快门与工具条）</span><input type="checkbox" id="swAutoPos"><i></i></label>
     </div>
 
     <h3 class="sec">拍摄</h3>
@@ -198,10 +200,18 @@
       <label class="switch-item"><span>自动影调（按画面实时拉伸黑场白场，去灰不发白）</span><input type="checkbox" id="swTone"><i></i></label>
     </div>
     <div class="field">
-      <span class="field-label">画质（高画质会用原生满幅拍摄）</span>
+      <span class="field-label">预览尺寸（越小越流畅，画面卡就往下调一档）</span>
+      <div class="seg" id="segSize">
+        <button data-v="720">720P</button>
+        <button data-v="1080">1080P</button>
+        <button data-v="1440">1440P</button>
+      </div>
+    </div>
+    <div class="field">
+      <span class="field-label">成片尺寸（原生满幅分辨率最高，跟随预览最省时）</span>
       <div class="seg" id="segQuality">
-        <button data-v="high">高画质</button>
-        <button data-v="standard">标准</button>
+        <button data-v="high">原生满幅</button>
+        <button data-v="standard">跟随预览</button>
       </div>
     </div>
     <div class="switch-list">
