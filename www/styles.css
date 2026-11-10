@@ -906,10 +906,16 @@ body.q270 #app{
 
 /* 横屏时高度只剩一半，原来那套竖排留白会把取景器压成一条缝。
    这里压掉纵向内边距、把工具条收紧成纯图标，把高度还给画面。 */
-body.land #app{position:fixed;overflow:hidden}
-body.land .stage-wrap{padding:0}
-body.land .stage-col{gap:0;position:relative}
-body.land .stage{border-radius:0}
+body.land #app{position:fixed;inset:0;overflow:hidden;padding-top:0}
+/* 画面就是整块屏幕：取景容器铺满，顶栏/工具条/快门全是浮层。
+   以前这里只写了 padding:0，容器仍是文档流里的 flex 子项，
+   旋转后拿到的可用高度是旧值，取景框就被压成一条横带。 */
+body.land .stage-wrap{
+  position:absolute;inset:0;padding:0;
+  display:flex;align-items:center;justify-content:center;
+}
+body.land .stage-col{gap:0;position:absolute;inset:0;width:auto;height:auto}
+body.land .stage{border-radius:0;max-width:100%;max-height:100%}
 
 body.land .controls{
   position:absolute;left:0;right:0;bottom:0;

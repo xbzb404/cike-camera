@@ -37,8 +37,8 @@ WWW = ROOT / "www"
 BUILD = ROOT / "build"
 
 APP_NAME = "此刻相机"
-DEFAULT_CODE = 14
-DEFAULT_NAME = "1.4.6"
+DEFAULT_CODE = 15
+DEFAULT_NAME = "1.4.7"
 
 # 本地签名材料（都已 gitignore）
 KEYSTORE = BUILD / "wmc.keystore"
@@ -56,6 +56,77 @@ SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
 
 # ---------------------------------------------------------------- manifest
+def axml_pool(data):
+    """读 AndroidManifest.xml 的字符串池，返回 (起始偏移, 表头长度, 字符串列表)。"""
+    buf = data
+    for pos in (8, 0):
+        if pos + 8 > len(buf):
+            continue
+        ctype, hsize, csize = struct.unpack_from("<HHI", buf, pos)
+        if ctype == 0x0001:
+            break
+    else:
+        raise RuntimeError("AndroidManifest.xml 里找不到字符串池")
+
+    cnt, _styc, flags, sstart, _stystart = struct.unpack_from("<IIIII", buf, pos + 8)
+    base = pos + sstart
+    utf8 = bool(flags & (1 << 8))
+    out = []
+    for i in range(cnt):
+        off = struct.unpack_from("<I", buf, pos + hsize + i * 4)[0]
+        p = base + off
+        if utf8:
+            p += 1
+            n = buf[p]; p += 1
+            if n & 0x80:
+                n = ((n & 0x7F) << 8) | buf[p]; p += 1
+            out.append(buf[p:p + n].decode("utf-8", "replace"))
+        else:
+            n = struct.unpack_from("<H", buf, p)[0]; p += 2
+            if n & 0x8000:
+                n = ((n & 0x7FFF) << 16) | struct.unpack_from("<H", buf, p)[0]
+                p += 2
+            out.append(buf[p:p + n * 2].decode("utf-16-le", "replace"))
+    return pos, hsize, out
+
+
+def patch_manifest_attr(data, elem_name, attr_name, value):
+    """把某个元素上的 int 属性原地改成新值（长度不变，只改 4 字节数据）。
+
+    壳的原作者把 Activity 钉死在竖屏（screenOrientation=1）：窗口不转，
+    WebView 就永远按竖屏出画面，横屏只能自己 CSS 转 90°，摄像头给的还是
+    竖版的流 —— 取景框怎么调都只是「一条竖带」。改成 13（fullUser）后
+    系统会真的转窗口，摄像头、布局、EXIF 全部跟着转，这才是正路。
+    它的 configChanges 里本来就带了 orientation|screenSize|smallestScreenSize，
+    所以旋转不会重建 Activity。"""
+    buf = bytearray(data)
+    pool_off, hsize, names = axml_pool(data)
+    cnt = len(names)
+
+    def name_of(idx):
+        return names[idx] if 0 <= idx < cnt else ""
+
+    pos = 8
+    while pos < len(buf) - 8:
+        ctype, _hsize, csize = struct.unpack_from("<HHI", buf, pos)
+        if ctype == 0x0102:  # START_ELEMENT
+            _ns, nm, astart, _asize, acount = struct.unpack_from("<IIHHH", buf, pos + 16)
+            if name_of(nm) == elem_name:
+                ap = pos + 16 + astart
+                for k in range(acount):
+                    o = ap + k * 20
+                    a_name = struct.unpack_from("<I", buf, o + 4)[0]
+                    if name_of(a_name) == attr_name:
+                        old = struct.unpack_from("<i", buf, o + 16)[0]
+                        struct.pack_into("<i", buf, o + 16, value)
+                        print(f"  {elem_name}/{attr_name}: {old} → {value}")
+                        return bytes(buf)
+        if csize == 0:
+            break
+        pos += csize
+    raise RuntimeError(f"清单里没找到 {elem_name}/{attr_name}")
+
+
 def patch_manifest(data, version_code, version_name):
     """直接改二进制 AndroidManifest.xml 里的 versionCode / versionName。
 
@@ -189,6 +260,8 @@ def iter_files(root, prefix):
 def pack(version_code, version_name, out_path):
     manifest = (SHELL / "AndroidManifest.xml").read_bytes()
     manifest = patch_manifest(manifest, version_code, version_name)
+    # 13 = fullUser：跟随系统旋转（也尊重系统的「旋转锁定」开关）
+    manifest = patch_manifest_attr(manifest, "activity", "screenOrientation", 13)
 
     if out_path.exists():
         out_path.unlink()

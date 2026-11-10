@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.4.6';
+const APP_VERSION = '1.4.7';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -37,7 +37,7 @@ const DEFAULTS = {
   pos: 'bl',            // bl | br | tl | tr（左下/右下/左上/右上）
   autoPos: true,        // 横屏时自动把水印挪到空着的角落
   size: '1080',         // 预览流长边：720 | 1080 | 1440
-  view: 'wide',         // wide 完整视角（不裁，默认）| fill 填满取景框
+  view: 'fill',         // fill 填满取景框（默认，取景框尽量大）| wide 完整视角
   wmScale: 1,           // 0.85 | 1 | 1.15
   autoInk: true,        // 按底图亮度自动切深/浅墨水
   fields: [],           // 自定义字段 [{k,v}]
@@ -88,10 +88,12 @@ function readSettings() {
   if (POS_MAP[s.pos]) s.pos = POS_MAP[s.pos];
   if (!['bl', 'br', 'tl', 'tr'].includes(s.pos)) s.pos = 'bl';
   if (!['720', '1080', '1440'].includes(String(s.size))) s.size = '1080';
-  // 视野：老版本默认「填满」，会把 4:3 整幅裁掉两侧 44%，看着就像被拉近了。
-  // 一次性迁到「完整」，之后用户自己改回来就不再干预。
-  if (!s.viewMigrated) { s.view = 'wide'; s.viewMigrated = true; }
-  if (!['fill', 'wide'].includes(s.view)) s.view = 'wide';
+  // 视野：默认「填满」。
+  // 旧版默认「完整」（contain），4:3 的流塞进取景框后会缩成中间一条，
+  // 看着就是「取景框怎么这么小」；1.4.7 起默认填满，并把还停在
+  // 「完整」的老设置一次性迁过来（之后用户自己改回去就不再干预）。
+  if (Number(s.viewMigrated) < 2) { s.view = 'fill'; s.viewMigrated = 2; }
+  if (!['fill', 'wide'].includes(s.view)) s.view = 'fill';
   // 老用户的设置里没有这个字段，必须显式补 true，否则 Object.assign 之后是 undefined
   if (typeof s.autoPos !== 'boolean') s.autoPos = true;
   // EV 一律不继承历史值。
@@ -732,42 +734,81 @@ function updateToolCaps() {
    ============================================================ */
 /* 方向状态。
    ------------------------------------------------------------
-   壳把 Activity 钉死在竖屏（manifest screenOrientation=1），所以系统
-   永远不会替我们转窗口，window.innerWidth 也永远是竖的 —— 这就是
-   「手机横过来界面不动」的真正原因，光靠 CSS 媒体查询救不回来。
+   1.4.7 起壳的 AndroidManifest 把 screenOrientation 从 1（钉死竖屏）
+   改成 13（fullUser）：系统会真的把窗口转过去，WebView 拿到真正的
+   横屏视口，摄像头也才会给出横版的流（这是「横屏预览框不变宽」的根因 ——
+   窗口不转时 WebKit 永远按竖屏输出画面，横过来只能得到一条竖带）。
 
-   这里改成陀螺仪驱动：读 deviceorientation 的 beta/gamma 算出重力在
-   机身坐标系里的方向，判断手机是竖放、左横、右横还是倒置，再把整个
-   #app 用 CSS 转 90° —— 相当于自己实现了一次屏幕旋转，好处是
-   可以随时「锁住当前方向」。 */
+   所以正常路径是「系统自己转，我们什么都不用做」；
+   只有两种兜底情况还需要 CSS 转 90°：
+     · 用户点了左上角「锁定方向」，或者系统开了旋转锁 —— 窗口不转；
+     · 个别机型窗口转了但 WebView 不跟着 resize。
+   转的时候按设备重力方向决定转哪一边（转错方向会整个上下颠倒）。 */
 const orient = {
-  auto: true,       // 是否跟随陀螺仪
-  q: 0,             // 0 竖 / 90 左横 / -90 右横 / 180 倒置
+  auto: true,       // 是否跟随设备
+  q: 0,             // 0 竖 / 90 / -90 横 / 180 倒置
   lockedQ: 0,       // 锁定时的方向
   cand: 0, candN: 0,// 候选方向与连续命中次数（防抖）
   hasSensor: false
 };
 
+/* 当前应该按哪个方向排版。
+   锁定值 > 窗口真实方向 > 陀螺仪（手机放平时陀螺仪没有横竖概念，
+   此时必须信窗口）。 */
 function isLandscape() {
-  if (orient.q === 90 || orient.q === -90) return true;
-  // 没有陀螺仪权限时退回视口比例判断
-  if (orient.hasSensor) return false;
-  return window.innerWidth > window.innerHeight && window.innerHeight < 620;
+  if (!orient.auto) return orient.lockedQ === 90 || orient.lockedQ === -90;
+  if (window.innerWidth > window.innerHeight) return true;
+  return orient.hasSensor && (orient.q === 90 || orient.q === -90);
+}
+
+/* #app 的布局空间。
+   自己转 90° 时 CSS 把宽高换成了 100vh/100vw，此时去量 clientWidth
+   会读到旋转前的旧值（这就是之前取景框莫名变成一小条的元凶），
+   所以这里直接用视口尺寸推算，不依赖任何测量。 */
+function appSpace() {
+  const rot = document.body.classList.contains('q90') || document.body.classList.contains('q270');
+  return rot
+    ? { w: window.innerHeight, h: window.innerWidth }
+    : { w: window.innerWidth, h: window.innerHeight };
+}
+
+/* 归一到 0 / ±90（180 在相机里等于正立） */
+function toQuarter(deg) {
+  const d = ((Math.round((deg || 0) / 90) * 90) % 360 + 360) % 360;
+  if (d === 90) return 90;
+  if (d === 270) return -90;
+  return 0;
 }
 
 let lastLandQ = null;
 let orientReopenTimer = 0;
 
 function applyOrientation() {
-  const q = orient.auto ? orient.q : orient.lockedQ;
   const body = document.body;
-  const land = q === 90 || q === -90;
-  // 只有「视口还是竖的、但设备已经横过来」时才需要自己转 90°。
-  // 真正横屏视口（平板、桌面窗口）本来就横着，再加旋转就转回去了。
-  const needRotate = land && window.innerHeight > window.innerWidth;
-  body.classList.toggle('q90', needRotate && q === 90);
-  body.classList.toggle('q270', needRotate && q === -90);
+  const land = isLandscape();
+  const actualLand = window.innerWidth > window.innerHeight;
+  // 目标方向和窗口方向不一致时才需要自己转
+  let deg = 0;
+  if (land !== actualLand) {
+    deg = toQuarter(land ? -orient.q : orient.lockedQ - orient.q);
+  }
+  body.classList.toggle('q90', deg === 90);
+  body.classList.toggle('q270', deg === -90);
   body.classList.toggle('land', land);
+
+  // 旋转时把 #app 的宽高写成显式像素，别让 CSS 的 100vh/100vw 在某些
+  // WebView 上算偏（写死之后 layoutStage 的推算和实际盒子一定一致）
+  const appEl = $('#app');
+  if (appEl) {
+    if (deg) {
+      appEl.style.width = window.innerHeight + 'px';
+      appEl.style.height = window.innerWidth + 'px';
+    } else {
+      appEl.style.width = '';
+      appEl.style.height = '';
+    }
+  }
+
   // 旋转会改变可用宽高，等一帧再排
   requestAnimationFrame(() => {
     layoutStage();
@@ -805,7 +846,10 @@ function angleFromGravity(gx, gy) {
   if (Math.abs(gy) >= Math.abs(gx)) {
     return gy < 0 ? 0 : 180;        // 正立 / 倒置
   }
-  // 重力指向 +x（右侧朝下）→ 手机向左横（顶部朝右）→ 内容顺时针转回来
+  // gx<0：重力落在机身左侧（-x）→ 手机顶部朝左横放（左横）；
+  // gx>0：顶部朝右（右横）。这里只负责判断「设备现在是哪个姿态」，
+  // 具体要把界面转多少度由 applyOrientation 决定（曾经在这里把方向
+  // 判断反了，结果整个界面转了 180°，横屏看着就是上下颠倒）。
   return gx > 0 ? 90 : -90;
 }
 
@@ -817,24 +861,24 @@ function initOrientation() {
   const onOrient = (e) => {
     if (e.beta == null && e.gamma == null) return;
     orient.hasSensor = true;
-    if (!orient.auto) return;
     const { gx, gy } = gravityOf(e.beta, e.gamma);
     const q = angleFromGravity(gx, gy);
-    // 防抖：连续 3 次（约 150ms）同一方向才真的转，避免手抖来回跳
+    // 防抖：连续 3 次（约 150ms）同一方向才认，避免手抖来回跳
     if (q === orient.cand) orient.candN++;
     else { orient.cand = q; orient.candN = 1; }
     if (orient.candN < 3) return;
     if (q === orient.q) return;
-    orient.q = q;
+    orient.q = q;                 // 锁定时也要记，锁定方向要靠它算回转角度
+    if (!orient.auto) return;
     applyOrientation();
   };
 
   window.addEventListener('deviceorientation', onOrient, true);
-  // 没有陀螺仪事件时（桌面浏览器、或权限被拒），退回看视口比例
+  // 窗口尺寸变了（系统旋转窗口 / 分屏 / 软键盘 / 桌面端拉伸），
+  // 方向判定要跟着重算 —— 以前这里只在没陀螺仪时才看一眼视口比例，
+  // 结果系统真把窗口转了之后 .land 还挂着旧值，取景框就缩成一条。
   window.addEventListener('resize', () => {
-    if (orient.hasSensor) return;
-    const q = window.innerWidth > window.innerHeight ? 90 : 0;
-    if (q !== orient.q) { orient.q = q; applyOrientation(); }
+    applyOrientation();
   });
 }
 
@@ -853,8 +897,11 @@ async function requestOrientPermission() {
 function setOrientAuto(on) {
   orient.auto = on;
   if (!on) {
-    orient.lockedQ = orient.q;
-    toast('已锁定：' + (isLandscape() ? '横屏' : '竖屏') + '（手机转动不再跟随）');
+    // 锁的是「现在看到的这个方向」，而不是陀螺仪读数（手机平放时读数是 0）
+    orient.lockedQ = isLandscape()
+      ? ((orient.q === 90 || orient.q === -90) ? orient.q : 90)
+      : 0;
+    toast('已锁定：' + (orient.lockedQ ? '横屏' : '竖屏') + '（手机转动不再跟随）');
   } else {
     toast('已恢复自动旋转');
   }
@@ -864,20 +911,42 @@ function setOrientAuto(on) {
 }
 
 function layoutStage() {
-  const cs = getComputedStyle(stageWrap);
-  const availW = stageWrap.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
-  let availH = stageWrap.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
-  // 横屏时工具条浮在画面上，不再占用文档流高度
   const land = isLandscape();
-  const bar = $('.bars');
-  if (bar && !land) availH -= bar.offsetHeight + 10;
+  const rot = document.body.classList.contains('q90') || document.body.classList.contains('q270');
+  const cs = getComputedStyle(stageWrap);
+  const padL = parseFloat(cs.paddingLeft) || 0;
+  const padR = parseFloat(cs.paddingRight) || 0;
+  const padT = parseFloat(cs.paddingTop) || 0;
+  const padB = parseFloat(cs.paddingBottom) || 0;
+
+  let availW, availH;
+  if (rot) {
+    // 自己转过 90°：元素盒子的宽高已经被换成 (视口高, 视口宽)，
+    // 这时量 clientWidth 会拿到旋转前的旧值，必须用视口尺寸推算。
+    const sp = appSpace();
+    availW = sp.w - padL - padR;
+    availH = sp.h - padT - padB;
+    if (!land) {
+      // 锁成竖屏但窗口是横的：顶栏/工具条/快门还在文档流里
+      const appCs = getComputedStyle($('#app'));
+      availH -= parseFloat(appCs.paddingTop) || 0;
+      ['topbar', 'bars', 'controls'].forEach(c => {
+        const el = $('.' + c);
+        if (el) availH -= el.offsetHeight;
+      });
+    }
+  } else {
+    availW = stageWrap.clientWidth - padL - padR;
+    availH = stageWrap.clientHeight - padT - padB;
+    const bar = $('.bars');
+    if (bar && !land) availH -= bar.offsetHeight + 10;
+  }
   if (availW <= 0 || availH <= 0) return;
 
-  // 取景框不再「按视频流比例算」—— 那是它变小的元凶。
-  // 摄像头给的流可能是 16:9 横（Android WebView 常见），竖着拿时按这个
-  // 比例排，画面上就只剩一条矮横带。
-  //   竖屏：固定 3:4，画面用 cover 填满，取景框占满可用区域；
-  //   横屏：直接铺满整块（顶栏/工具条/快门都是浮层，不再抢高度）。
+  // 取景框要尽量大：
+  //   竖屏：固定 3:4（手机竖着拿的取景习惯），画面用 cover 填满；
+  //   横屏：整块铺满 —— 顶栏、工具条、快门都是浮层，画面就是全屏。
+  // 注意不是「按视频流比例排版」：那会让 4:3 的流在竖屏里缩成一条矮带。
   let w, h;
   if (land) {
     w = availW;
@@ -895,7 +964,7 @@ function layoutStage() {
   // 画面方向校正需要知道取景框的实际尺寸（旋转后宽高对调）
   stage.style.setProperty('--vsw', W + 'px');
   stage.style.setProperty('--vsh', H + 'px');
-  // 视野：wide 时 video 用 contain（不裁两侧，可能留黑边）
+  // 视野：wide 时 video 用 contain（整幅都看得见，代价是留边）
   stage.classList.toggle('view-wide', S.view === 'wide');
   applyVideoTransform();
   renderOverlay();
