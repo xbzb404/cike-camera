@@ -121,9 +121,9 @@
       }
     }
 
-    // 像素尺寸（用于判断是否被裁剪过，可选）
-    out.width = shortVal(ifd[0xA002]);
-    out.height = shortVal(ifd[0xA003]);
+    // 像素尺寸：标准放在 Exif 子 IFD（0xA002/0xA003），部分机型写在 IFD0，两处都看
+    out.width = shortVal((exifIfd && exifIfd[0xA002]) || ifd[0xA002]);
+    out.height = shortVal((exifIfd && exifIfd[0xA003]) || ifd[0xA003]);
 
     return out;
   }

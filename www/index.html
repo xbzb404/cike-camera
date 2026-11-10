@@ -7,7 +7,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="此刻相机">
-<meta name="description" content="拍照自动添加时间、地点、经纬度、名称水印">
+<meta name="description" content="拍照自动添加时间、地点、经纬度水印，带数字签名可验真">
 <title>此刻相机</title>
 <link rel="icon" href="icons/icon.svg">
 <link rel="manifest" href="manifest.json">
@@ -50,6 +50,13 @@
     <div class="stage" id="stage">
       <video id="video" playsinline autoplay muted></video>
       <canvas id="overlay"></canvas>
+
+      <div class="grid-lines" id="gridLines"><i></i><i></i><i></i><i></i></div>
+      <div class="focus-ring" id="focusRing"></div>
+      <div class="flash" id="flash"></div>
+      <div class="countdown" id="countdown" hidden></div>
+      <div class="level-wrap"><span class="level-bar" id="levelBar"></span></div>
+
       <div class="lensbar" id="lensBar" hidden></div>
 
       <div class="stage-guard" id="stageGuard">
@@ -58,21 +65,47 @@
       </div>
     </div>
 
-    <div class="stylebar">
-     <button class="style-btn" id="btnStyle">
-      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="8" rx="2"></rect><rect x="13" y="3" width="8" height="8" rx="2"></rect><rect x="3" y="13" width="8" height="8" rx="2"></rect><rect x="13" y="13" width="8" height="8" rx="2"></rect></svg>
-      <span>水印样式</span>
-      <b id="styleName">经典</b>
-      <svg class="chev" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
-     </button>
+    <div class="bars">
+      <div class="toolbar">
+        <button class="tool" id="btnTimer" title="定时拍摄">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"></circle><path d="M12 9v4l2.5 2.5"></path><path d="M9 2h6"></path></svg>
+          <span>定时</span>
+        </button>
+        <button class="tool" id="btnTorch" title="补光灯" hidden>
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4.5 13H11l-1 9 8.5-11H12l1-9Z"></path></svg>
+          <span>补光</span>
+        </button>
+        <button class="tool" id="btnGrid" title="构图网格">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M9 3v18M15 3v18M3 9h18M3 15h18"></path></svg>
+          <span>网格</span>
+        </button>
+        <button class="tool" id="btnLevel" title="水平仪">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 12h4l2-4 3 8 2.5-5 1.5 3h5"></path></svg>
+          <span>水平</span>
+        </button>
+        <div class="ev" id="evRow" hidden>
+          <span>EV</span>
+          <input id="evSlider" type="range" min="-2" max="2" step="0.1" value="0">
+          <b id="evVal">0.0</b>
+        </div>
+      </div>
+
+      <div class="stylebar">
+        <button class="style-btn" id="btnStyle">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="8" height="8" rx="2"></rect><rect x="13" y="3" width="8" height="8" rx="2"></rect><rect x="3" y="13" width="8" height="8" rx="2"></rect><rect x="13" y="13" width="8" height="8" rx="2"></rect></svg>
+          <span>水印样式</span>
+          <b id="styleName">经典</b>
+          <svg class="chev" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"></path></svg>
+        </button>
+      </div>
     </div>
    </div>
   </main>
 
   <footer class="controls">
-    <button class="side-btn" id="btnGallery" aria-label="从相册选择">
+    <button class="side-btn" id="btnGallery" aria-label="图库">
       <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><path d="m21 15-5-5L5 21"></path></svg>
-      <span>相册</span>
+      <span>图库</span>
     </button>
 
     <button class="shutter" id="btnShutter" aria-label="拍照"><span></span></button>
@@ -96,6 +129,8 @@
   </div>
 
   <div class="sheet-body">
+    <h3 class="sec">基本信息</h3>
+
     <label class="field">
       <span class="field-label">名称 / 单位</span>
       <input type="text" id="inpTitle" placeholder="例如：XX项目部 · 张三" maxlength="24">
@@ -104,47 +139,77 @@
     <label class="field">
       <span class="field-label">地点（留空则自动获取）</span>
       <div class="field-row">
-        <input type="text" id="inpPlace" placeholder="自动定位地址" maxlength="30">
+        <input type="text" id="inpPlace" placeholder="自动定位地址" maxlength="40">
         <button class="mini-btn" id="btnAutoPlace">用定位</button>
       </div>
     </label>
 
     <label class="field">
-      <span class="field-label">高德 Web服务 Key（可选，填了地址精确到街道门牌）</span>
-      <input type="text" id="inpAmap" placeholder="在高德开放平台申请「Web服务」类型 Key" maxlength="64" autocomplete="off">
+      <span class="field-label">自定义字段（每行一条，如「标段：三标」）</span>
+      <textarea id="inpFields" rows="3" placeholder="标段：三标&#10;天气：晴&#10;负责人：张三" maxlength="400"></textarea>
     </label>
 
+    <label class="field">
+      <span class="field-label">高德 Web 服务 Key（可选，填了地址精确到门牌）</span>
+      <input type="text" id="inpAmap" placeholder="在高德开放平台申请「Web 服务」类型 Key" maxlength="64" autocomplete="off">
+    </label>
+
+    <h3 class="sec">显示内容</h3>
     <div class="switch-list">
-      <label class="switch-item">
-        <span>显示时间</span>
-        <input type="checkbox" id="swTime"><i></i>
-      </label>
-      <label class="switch-item">
-        <span>显示秒</span>
-        <input type="checkbox" id="swSeconds"><i></i>
-      </label>
-      <label class="switch-item">
-        <span>显示地点</span>
-        <input type="checkbox" id="swPlace"><i></i>
-      </label>
-      <label class="switch-item">
-        <span>显示经纬度</span>
-        <input type="checkbox" id="swCoords"><i></i>
-      </label>
-      <label class="switch-item">
-        <span>经纬度用高德坐标（GCJ-02）</span>
-        <input type="checkbox" id="swGcj"><i></i>
-      </label>
-      <label class="switch-item">
-        <span>显示天气</span>
-        <input type="checkbox" id="swWeather"><i></i>
-      </label>
-      <label class="switch-item">
-        <span>显示验真码</span>
-        <input type="checkbox" id="swCode"><i></i>
-      </label>
+      <label class="switch-item"><span>显示时间</span><input type="checkbox" id="swTime"><i></i></label>
+      <label class="switch-item"><span>显示秒</span><input type="checkbox" id="swSeconds"><i></i></label>
+      <label class="switch-item"><span>显示地点</span><input type="checkbox" id="swPlace"><i></i></label>
+      <label class="switch-item"><span>显示经纬度</span><input type="checkbox" id="swCoords"><i></i></label>
+      <label class="switch-item"><span>显示海拔</span><input type="checkbox" id="swAlt"><i></i></label>
+      <label class="switch-item"><span>显示定位精度</span><input type="checkbox" id="swAcc"><i></i></label>
+      <label class="switch-item"><span>显示天气</span><input type="checkbox" id="swWeather"><i></i></label>
+      <label class="switch-item"><span>显示验真码</span><input type="checkbox" id="swCode"><i></i></label>
+      <label class="switch-item"><span>经纬度用高德坐标（GCJ-02）</span><input type="checkbox" id="swGcj"><i></i></label>
     </div>
 
+    <div class="field">
+      <span class="field-label">经纬度格式</span>
+      <div class="seg" id="segCoord">
+        <button data-v="zh">北纬 31.2°</button>
+        <button data-v="dec">31.230416</button>
+      </div>
+    </div>
+
+    <h3 class="sec">水印外观</h3>
+    <div class="field">
+      <span class="field-label">位置</span>
+      <div class="seg" id="segPos">
+        <button data-v="bottom">左下</button>
+        <button data-v="br">右下</button>
+        <button data-v="top">顶部</button>
+      </div>
+    </div>
+    <div class="field">
+      <span class="field-label">字号</span>
+      <div class="seg" id="segScale">
+        <button data-v="0.85">小</button>
+        <button data-v="1">标准</button>
+        <button data-v="1.15">大</button>
+      </div>
+    </div>
+    <div class="switch-list">
+      <label class="switch-item"><span>自动取色（按底图明暗切换黑白墨水）</span><input type="checkbox" id="swInk"><i></i></label>
+    </div>
+
+    <h3 class="sec">拍摄</h3>
+    <div class="field">
+      <span class="field-label">画质（高画质会用原生满幅拍摄）</span>
+      <div class="seg" id="segQuality">
+        <button data-v="high">高画质</button>
+        <button data-v="standard">标准</button>
+      </div>
+    </div>
+    <div class="switch-list">
+      <label class="switch-item"><span>智能择优（连取 3 帧选最清晰）</span><input type="checkbox" id="swSmart"><i></i></label>
+      <label class="switch-item"><span>写入标准 EXIF（时间/坐标/机型）</span><input type="checkbox" id="swExif"><i></i></label>
+    </div>
+
+    <h3 class="sec">签名</h3>
     <div class="sign-box">
       <div class="sign-head">
         <span>我的签名公钥指纹</span>
@@ -155,7 +220,7 @@
       <a class="sign-link" href="verify.html" target="_blank" rel="noopener">打开验真页 →</a>
     </div>
 
-    <p class="tip">提示：定位需要授权，且必须在 HTTPS 或本机环境下才可用。地址由地图服务解析，可能不准，可手动填写。</p>
+    <p class="tip">定位需要授权。地址由地图服务解析，可能不准，可手动填写。保存到相册后请用「原图」方式转发，压缩会破坏签名。</p>
   </div>
 </section>
 
@@ -170,6 +235,22 @@
   <div class="style-grid" id="styleGrid"></div>
 </section>
 
+<!-- 图库面板 -->
+<div class="sheet-mask" id="galleryMask"></div>
+<section class="sheet" id="gallery" aria-label="图库">
+  <div class="sheet-handle"></div>
+  <div class="sheet-head">
+    <h2>图库</h2>
+    <button class="text-btn" id="btnGalleryClose">关闭</button>
+  </div>
+  <div class="sheet-body">
+    <button class="btn-primary wide" id="btnPickFile">从相册导入照片加印</button>
+    <div class="history-grid" id="historyGrid"></div>
+    <button class="btn-ghost wide" id="btnSaveAll" hidden>全部保存到相册</button>
+    <p class="tip">这里的照片只存在于本次运行中，退出应用即清空。点开可预览、保存或分享。</p>
+  </div>
+</section>
+
 <!-- 预览 -->
 <div class="preview" id="preview">
   <button class="preview-close" id="btnClosePreview" aria-label="关闭">
@@ -179,10 +260,11 @@
     <img id="previewImg" alt="拍摄结果">
   </div>
   <p class="preview-code" id="previewCode"></p>
-  <p class="preview-hint" id="previewHint">点「保存到相册」；若没有自动保存，长按图片选择「存储图像」</p>
+  <p class="preview-hint" id="previewHint">保存后用「原图/文件」方式转发，压缩会破坏签名</p>
   <div class="preview-bar">
     <button class="btn-ghost" id="btnRetake">重拍</button>
-    <button class="btn-primary" id="btnSave">保存到相册</button>
+    <button class="btn-ghost" id="btnEditWm">改水印</button>
+    <button class="btn-primary" id="btnSave">保存</button>
     <button class="btn-ghost" id="btnShare" hidden>分享</button>
   </div>
 </div>
@@ -191,6 +273,8 @@
 
 <script src="js/crypto-wmc.js"></script>
 <script src="js/exif.js"></script>
+<script src="js/exif-write.js"></script>
+<script src="js/wm-core.js"></script>
 <script src="js/native.js"></script>
 <script src="app.js"></script>
 </body>

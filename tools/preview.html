@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>水印样式预览台 · 此刻相机</title>
+<style>
+  :root { color-scheme: dark; }
+  body{margin:0;background:#0b0d10;color:#eef2f8;
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+  header{padding:22px 26px 8px}
+  h1{margin:0;font-size:17px;font-weight:600;letter-spacing:.5px}
+  p{margin:6px 0 0;font-size:12px;color:#8e99aa}
+  #grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;padding:18px 26px 34px}
+  @media (min-width:1000px){ #grid{grid-template-columns:repeat(4,1fr)} }
+  .cell{background:#11151c;border:1px solid #222a36;border-radius:14px;overflow:hidden}
+  .cell canvas{display:block;width:100%;height:auto}
+  .cap{padding:8px 10px;font-size:11.5px;color:#93a0b2;display:flex;justify-content:space-between}
+  .cap b{color:#ffd24a;font-weight:600}
+</style>
+</head>
+<body>
+<header>
+  <h1>水印样式预览台</h1>
+  <p>同一组数据 × 8 种样式 × 亮/暗两种底图，用于检查排版、对比度与自动取色。</p>
+</header>
+<div id="grid"></div>
+
+<script src="../www/js/wm-core.js"></script>
+<script>
+'use strict';
+
+/* ---------- 合成一张“照片”，不依赖任何外部图片 ---------- */
+function makePhoto(w, h, bright) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const x = c.getContext('2d');
+
+  const g = x.createLinearGradient(0, 0, w * 0.4, h);
+  if (bright) {
+    g.addColorStop(0, '#e8eef6');
+    g.addColorStop(0.55, '#cbd8e6');
+    g.addColorStop(1, '#eef3f8');
+  } else {
+    g.addColorStop(0, '#20303f');
+    g.addColorStop(0.55, '#131c26');
+    g.addColorStop(1, '#0a1017');
+  }
+  x.fillStyle = g;
+  x.fillRect(0, 0, w, h);
+
+  // 远景：几块“建筑”
+  for (let i = 0; i < 6; i++) {
+    const bw = w * (0.1 + Math.random() * 0.12);
+    const bh = h * (0.16 + Math.random() * 0.3);
+    const bx = Math.random() * (w - bw);
+    x.fillStyle = bright
+      ? `rgba(90,110,130,${0.10 + Math.random() * 0.12})`
+      : `rgba(180,200,220,${0.07 + Math.random() * 0.1})`;
+    x.fillRect(bx, h * 0.66 - bh, bw, bh);
+  }
+
+  // 地面
+  x.fillStyle = bright ? 'rgba(120,135,150,.18)' : 'rgba(0,0,0,.32)';
+  x.fillRect(0, h * 0.66, w, h * 0.34);
+
+  // 主体：一个“设备”
+  x.fillStyle = bright ? '#4a5a6b' : '#26333f';
+  x.fillRect(w * 0.34, h * 0.36, w * 0.32, h * 0.30);
+  x.fillStyle = bright ? '#8fa1b3' : '#3a4a5a';
+  x.fillRect(w * 0.38, h * 0.40, w * 0.24, h * 0.18);
+
+  // 高光，制造真实感
+  const hl = x.createRadialGradient(w * 0.78, h * 0.1, 0, w * 0.78, h * 0.1, w * 0.5);
+  hl.addColorStop(0, bright ? 'rgba(255,255,255,.85)' : 'rgba(120,180,255,.22)');
+  hl.addColorStop(1, 'rgba(255,255,255,0)');
+  x.fillStyle = hl;
+  x.fillRect(0, 0, w, h);
+
+  return c;
+}
+
+const S = {
+  title: 'XX 项目部 · 张三',
+  showTime: true, showSeconds: true, showPlace: true, showCoords: true,
+  showWeather: true, showAltitude: true, showAccuracy: false, showCode: true,
+  coordFmt: 'zh', fields: [{ k: '标段', v: '三标' }, { k: '工序', v: '混凝土浇筑' }]
+};
+
+const base = {
+  time: new Date(2026, 10, 10, 14, 32, 17),
+  lat: 31.230416, lng: 121.473701, acc: 8, altitude: 12.4,
+  addr: '江苏省南京市玄武区中山东路 1 号（近 XX 大厦）',
+  weather: '18°C 多云'
+};
+
+const code = 'K7MQ-3PZA';
+const d = WM.buildData(base, S, code);
+
+const grid = document.getElementById('grid');
+const CSS_W = 420;
+const CSS_H = 560;
+
+WM.STYLES.forEach(meta => {
+  [false, true].forEach(bright => {
+    const cell = document.createElement('div');
+    cell.className = 'cell';
+
+    const canvas = document.createElement('canvas');
+    canvas.width = CSS_W * 2;
+    canvas.height = CSS_H * 2;
+    const ctx = canvas.getContext('2d');
+
+    const photo = makePhoto(canvas.width, canvas.height, bright);
+    ctx.drawImage(photo, 0, 0);
+
+    const ink = WM.measureInk(ctx, canvas.width, canvas.height, 'bottom');
+    WM.draw(ctx, canvas.width, canvas.height, d, {
+      style: meta.id, pos: 'bottom', scale: 1, ink, s: S
+    });
+
+    const cap = document.createElement('div');
+    cap.className = 'cap';
+    cap.innerHTML = `<b>${meta.name}</b><span>${bright ? '亮底' : '暗底'} · ink=${ink}</span>`;
+
+    cell.appendChild(canvas);
+    cell.appendChild(cap);
+    grid.appendChild(cell);
+  });
+});
+</script>
+</body>
+</html>

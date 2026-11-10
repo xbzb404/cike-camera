@@ -12,6 +12,8 @@
 }
 
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+/* 自定义 display 的组件（.tool / .ev）会盖掉 hidden 属性，这里统一兜住 */
+[hidden]{display:none !important}
 html,body{height:100%;margin:0}
 body{
   background:var(--bg);
@@ -116,7 +118,87 @@ body{
 .stage-guard.show{display:flex}
 .stage-guard p{margin:0;font-size:13px;color:var(--sub);line-height:1.6}
 
-/* ---------- 样式入口 ---------- */
+/* ---------- 取景器内的辅助层 ---------- */
+.grid-lines{position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .18s}
+.grid-lines.show{opacity:1}
+.grid-lines i{position:absolute;background:rgba(255,255,255,.22)}
+.grid-lines i:nth-child(1){left:33.33%;top:0;bottom:0;width:1px}
+.grid-lines i:nth-child(2){left:66.66%;top:0;bottom:0;width:1px}
+.grid-lines i:nth-child(3){top:33.33%;left:0;right:0;height:1px}
+.grid-lines i:nth-child(4){top:66.66%;left:0;right:0;height:1px}
+
+.focus-ring{
+  position:absolute;width:64px;height:64px;margin:-32px 0 0 -32px;
+  border:2px solid var(--accent);border-radius:8px;
+  opacity:0;pointer-events:none;
+}
+.focus-ring.run{animation:focusPulse .7s ease-out}
+@keyframes focusPulse{
+  0%{opacity:1;transform:scale(1.25)}
+  40%{opacity:1;transform:scale(1)}
+  100%{opacity:0;transform:scale(1)}
+}
+
+.flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none}
+.flash.run{animation:flashFade .34s ease-out}
+@keyframes flashFade{0%{opacity:.72}100%{opacity:0}}
+
+.countdown{
+  position:absolute;inset:0;display:grid;place-items:center;
+  font-size:86px;font-weight:800;color:#fff;
+  background:rgba(6,8,12,.42);pointer-events:none;
+  text-shadow:0 6px 30px rgba(0,0,0,.6);
+}
+.countdown.run{animation:cdPulse .9s ease-out}
+@keyframes cdPulse{0%{transform:scale(1.5);opacity:0}30%{transform:scale(1);opacity:1}100%{transform:scale(1);opacity:.9}}
+
+.level-wrap{
+  position:absolute;left:0;right:0;top:50%;display:grid;place-items:center;
+  pointer-events:none;opacity:0;transition:opacity .2s;
+}
+.level-bar{
+  display:block;width:96px;height:2px;border-radius:2px;
+  background:rgba(255,255,255,.45);
+  transition:background .18s, transform .08s linear;
+}
+.level-bar.show{opacity:1}
+.level-wrap:has(.level-bar.show){opacity:1}
+.level-bar.ok{background:var(--accent);box-shadow:0 0 12px rgba(255,210,74,.7)}
+.stage.guard-on .level-wrap{opacity:0}
+
+/* ---------- 工具条 + 样式入口 ---------- */
+.bars{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;gap:9px;width:100%}
+.toolbar{
+  display:flex;align-items:center;gap:7px;flex-wrap:nowrap;
+  max-width:100%;overflow-x:auto;scrollbar-width:none;padding:1px;
+}
+.toolbar::-webkit-scrollbar{display:none}
+.tool{
+  display:inline-flex;align-items:center;gap:4px;flex:0 0 auto;
+  padding:6px 10px;border-radius:999px;
+  border:1px solid var(--line);
+  background:rgba(255,255,255,.03);
+  color:var(--sub);font-size:11.5px;font-family:inherit;
+  transition:color .16s, background .16s, border-color .16s;
+}
+.tool.on{color:#141414;background:var(--accent);border-color:var(--accent)}
+.tool:active{transform:scale(.96)}
+.ev{
+  display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;
+  padding:4px 10px;border-radius:999px;
+  border:1px solid var(--line);background:rgba(255,255,255,.03);
+  font-size:11px;color:var(--sub);
+}
+.ev input[type=range]{
+  -webkit-appearance:none;appearance:none;width:76px;height:2px;border-radius:2px;
+  background:linear-gradient(90deg,#39414f,#39414f);outline:none;
+}
+.ev input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none;width:12px;height:12px;border-radius:50%;
+  background:var(--accent);border:none;
+}
+.ev b{color:var(--txt);font-weight:600;min-width:26px;text-align:right;font-variant-numeric:tabular-nums}
+
 .stylebar{
   flex:0 0 auto;
   display:flex;
@@ -412,8 +494,8 @@ input[type=text]::placeholder{color:#5d6675}
   padding:10px 18px calc(18px + var(--safe-b));
 }
 .btn-primary,.btn-ghost{
-  flex:1;
-  padding:14px;
+  flex:0 0 auto;
+  padding:14px 22px;
   border-radius:14px;
   border:1px solid var(--line);
   font-size:15px;
@@ -428,8 +510,11 @@ input[type=text]::placeholder{color:#5d6675}
 .btn-ghost{
   background:var(--panel);
   color:var(--txt);
-  flex:0 0 96px;
 }
+/* 预览栏里的按钮均分剩余宽度 */
+.preview-bar .btn-primary,.preview-bar .btn-ghost{flex:1 1 0;padding:14px 8px}
+/* 取景器提示层里的按钮：不要被 flex 拉成竖条 */
+.stage-guard .btn-primary{flex:0 0 auto;padding:11px 26px;font-size:14px;border-radius:12px}
 .btn-primary:active,.btn-ghost:active{transform:scale(.98)}
 
 /* ---------- toast ---------- */
@@ -612,3 +697,90 @@ input[type=text]::placeholder{color:#5d6675}
 .style-item.on{border-color:rgba(255,210,74,.7)}
 .style-item.on .si-foot{color:#ffd24a}
 .style-item.on .si-check{opacity:1;transform:scale(1)}
+
+/* ============================================================
+   v1.3 新增：设置分区 / 分段选择 / 多行输入 / 图库
+   ============================================================ */
+.sec{
+  margin:22px 0 8px;
+  font-size:11.5px;
+  font-weight:600;
+  letter-spacing:1.4px;
+  color:rgba(255,210,74,.82);
+  text-transform:uppercase;
+}
+.sec:first-child{margin-top:4px}
+
+textarea{
+  width:100%;
+  padding:10px 12px;
+  border-radius:12px;
+  border:1px solid var(--line);
+  background:#0d1117;
+  color:var(--txt);
+  font-size:13px;
+  font-family:inherit;
+  line-height:1.65;
+  resize:vertical;
+  outline:none;
+  min-height:64px;
+}
+textarea:focus{border-color:rgba(255,210,74,.55)}
+textarea::placeholder{color:#5d6675}
+
+.seg{
+  display:flex;gap:6px;
+  padding:3px;
+  border-radius:12px;
+  border:1px solid var(--line);
+  background:#0d1117;
+}
+.seg button{
+  flex:1 1 0;
+  padding:8px 4px;
+  border:0;border-radius:9px;
+  background:transparent;
+  color:var(--sub);
+  font-size:12.5px;
+  font-family:inherit;
+  transition:background .16s, color .16s;
+  white-space:nowrap;
+}
+.seg button.on{background:var(--accent);color:#161104;font-weight:600}
+.seg button:active{transform:scale(.98)}
+
+.btn-primary.wide,.btn-ghost.wide{width:100%;margin:14px 0 4px}
+
+.history-grid{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:8px;
+  margin-top:14px;
+}
+.history-grid .empty{
+  grid-column:1/-1;
+  margin:10px 0;
+  font-size:12px;
+  line-height:1.7;
+  color:var(--sub);
+  text-align:center;
+}
+.shot{
+  position:relative;
+  padding:0;border:0;border-radius:12px;
+  overflow:hidden;background:#11151c;
+  aspect-ratio:3/4;
+}
+.shot img{width:100%;height:100%;object-fit:cover;display:block}
+.shot span{
+  position:absolute;left:0;right:0;bottom:0;
+  padding:9px 6px 4px;
+  font-size:10px;
+  color:#fff;
+  background:linear-gradient(to bottom,rgba(0,0,0,0),rgba(0,0,0,.68));
+  font-variant-numeric:tabular-nums;
+}
+.shot:active{transform:scale(.97)}
+
+.preview-bar{gap:8px}
+.preview-bar .btn-primary,.preview-bar .btn-ghost{padding-left:14px;padding-right:14px;font-size:13px}

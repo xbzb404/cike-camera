@@ -1,59 +1,98 @@
 'use strict';
 
 /* ============================================================
-   此刻相机 · 签名版
+   此刻相机 · v1.3
+   ------------------------------------------------------------
+   三层结构：
+     js/wm-core.js      水印渲染引擎（纯函数，8 种样式）
+     js/exif-write.js   标准 EXIF 写入（时间 / GPS / 机型）
+     app.js             相机控制 + 拍摄流水线 + UI（本文件）
+   ------------------------------------------------------------
+   拍摄流水线（v1.3 重写）：
+     按下快门
+       → 取图：优先 ImageCapture 原生满幅，失败退预览帧
+       → 择优：连取 3 帧算拉普拉斯方差，取最清晰那张（防手抖）
+       → 合成：按预览所见比例裁剪 + 前置镜像 + 变焦裁切，零误差
+       → 取色：采样水印区域亮度，自动切深/浅墨水
+       → 绘印：wm-core 按样式绘制
+       → 编码：JPEG（质量可调）
+       → EXIF：写入 DateTimeOriginal / GPS / Make / Model
+       → 签名：ECDSA-P256 签名 → 哈希 → 写入 APP15 签名段
+       → 预览 / 保存 / 分享
    ============================================================ */
 
 const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
-const FONT = '-apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif';
-const LS_KEY = 'wmc.settings.v2';
+
+const APP_VERSION = '1.3.0';
+const LS_KEY = 'wmc.settings.v3';
+const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
 const DEFAULTS = {
   title: '此刻相机',
   place: '',
   amapKey: '',
+  style: 'classic',
+  pos: 'bottom',        // bottom | br | top
+  wmScale: 1,           // 0.85 | 1 | 1.15
+  autoInk: true,        // 按底图亮度自动切深/浅墨水
+  fields: [],           // 自定义字段 [{k,v}]
   showTime: true,
   showSeconds: true,
   showPlace: true,
   showCoords: true,
   showWeather: true,
+  showAltitude: false,
+  showAccuracy: false,
   showCode: true,
+  coordFmt: 'zh',       // zh | dec
   coordGcj: false,
-  style: 'classic'
+  quality: 'high',      // high | standard
+  smartPick: true,
+  writeExif: true,
+  jpegQuality: 0.94,
+  grid: false,
+  level: true,
+  timer: 0,             // 0 | 3 | 10
+  ev: 0                 // 曝光补偿
 };
 
-const STYLE_IDS = ['classic', 'card', 'hero', 'strip', 'tag', 'minimal'];
-const STYLE_META = [
-  { id: 'classic', name: '经典' },
-  { id: 'card', name: '卡片' },
-  { id: 'hero', name: '大字' },
-  { id: 'strip', name: '侧栏' },
-  { id: 'tag', name: '横幅' },
-  { id: 'minimal', name: '极简' }
-];
-function styleName(id) {
-  const m = STYLE_META.find(x => x.id === id);
-  return m ? m.name : '经典';
+function readSettings() {
+  let raw = null;
+  try {
+    raw = localStorage.getItem(LS_KEY);
+    if (!raw) {
+      for (const k of OLD_KEYS) {
+        const v = localStorage.getItem(k);
+        if (v) { raw = v; break; }
+      }
+    }
+  } catch (e) {}
+  let s = { ...DEFAULTS };
+  if (raw) {
+    try {
+      s = Object.assign(s, JSON.parse(raw));
+    } catch (e) {}
+  }
+  // 旧版本默认名的迁移
+  if ((s.title || '').trim() === '水印相机') s.title = DEFAULTS.title;
+  if (!WM.STYLES.some(x => x.id === s.style)) s.style = DEFAULTS.style;
+  if (!Array.isArray(s.fields)) s.fields = [];
+  if (!['bottom', 'br', 'top'].includes(s.pos)) s.pos = 'bottom';
+  if (![0, 3, 10].includes(Number(s.timer))) s.timer = 0;
+  return s;
 }
 
-function readSettings() {
-  try {
-    const raw = localStorage.getItem(LS_KEY) || localStorage.getItem('wmc.settings.v1');
-    if (!raw) return { ...DEFAULTS };
-    const s = Object.assign({}, DEFAULTS, JSON.parse(raw));
-    // 改名迁移：旧版本存下来的默认名称跟着换掉
-    if ((s.title || '').trim() === '水印相机') s.title = DEFAULTS.title;
-    if (STYLE_IDS.indexOf(s.style) < 0) s.style = DEFAULTS.style;
-    return s;
-  } catch (e) {
-    return { ...DEFAULTS };
-  }
-}
 let S = readSettings();
 
 function saveSettings() {
   try { localStorage.setItem(LS_KEY, JSON.stringify(S)); } catch (e) {}
+}
+
+function styleName(id) {
+  const m = WM.STYLES.find(x => x.id === id);
+  return m ? m.name : '经典';
 }
 
 /* ---------- DOM ---------- */
@@ -67,421 +106,505 @@ const btnEnableCam = $('#btnEnableCam');
 const toastEl = $('#toast');
 
 /* ============================================================
-   画布排版工具
+   相机
    ============================================================ */
-function setFont(ctx, size, weight) {
-  ctx.font = `${weight} ${size}px ${FONT}`;
+let stream = null;
+let facing = 'environment';
+let imageCapture = null;
+
+/* 焦距 / 变焦 */
+let lensList = [];
+let lensIndex = 0;
+let curDeviceId = null;
+let lensMode = 'none';        // optical | zoom | crop | none
+let zoom = { type: 'none', v: 1 };
+
+/* 能力 */
+let caps = {};
+let trackRef = null;
+
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => toastEl.classList.remove('show'), 3200);
 }
 
-function truncate(ctx, text, maxW) {
-  if (maxW <= 0) return '';
-  if (ctx.measureText(text).width <= maxW) return text;
-  let t = text;
-  while (t.length > 1 && ctx.measureText(t + '…').width > maxW) t = t.slice(0, -1);
-  return t + '…';
+function showGuard(text, btnLabel) {
+  guardText.textContent = text;
+  btnEnableCam.textContent = btnLabel || '重试';
+  guard.classList.add('show');
+  if (stage) stage.classList.add('guard-on');
 }
-
-function roundRect(ctx, x, y, w, h, r) {
-  const rr = Math.min(r, w / 2, h / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + rr, y);
-  ctx.arcTo(x + w, y, x + w, y + h, rr);
-  ctx.arcTo(x + w, y + h, x, y + h, rr);
-  ctx.arcTo(x, y + h, x, y, rr);
-  ctx.arcTo(x, y, x + w, y, rr);
-  ctx.closePath();
+function hideGuard() {
+  guard.classList.remove('show');
+  if (stage) stage.classList.remove('guard-on');
 }
+function showBusy(t) { showGuard(t || '处理中…', '请稍候'); }
+function hideBusy() { hideGuard(); }
 
-const LINE_H = 1.32;
-
-function buildLines(d, s) {
-  const L = [];
-  if (d.title) L.push({ t: d.title, size: 44 * s, weight: 700, gap: 14 * s });
-  if (S.showTime && d.timeText) L.push({ t: d.timeText, size: 31 * s, weight: 500, gap: 6 * s });
-  if (S.showPlace && d.location) L.push({ t: d.location, size: 31 * s, weight: 500, gap: 6 * s });
-  if (S.showCoords && d.coords) L.push({ t: d.coords, size: 31 * s, weight: 500, gap: 6 * s });
-  if (S.showWeather && d.weather) L.push({ t: d.weather, size: 31 * s, weight: 500, gap: 6 * s });
-  if (S.showCode && d.code) L.push({ t: '验真码 ' + d.code, size: 27 * s, weight: 600, gap: 0 });
-  return L;
-}
-
-function blockHeight(L) {
-  return L.reduce((h, l) => h + l.size * LINE_H + l.gap, 0);
-}
-
-/* ---------- 样式一：经典左竖条 ---------- */
-function drawClassic(ctx, W, H, d) {
-  const s = W / 1080;
-  const L = buildLines(d, s);
-  if (!L.length) return;
-  const padX = 54 * s;
-  const padY = 62 * s;
-  const totalH = blockHeight(L);
-  const textX = padX + 28 * s;
-  const maxW = W - textX - 54 * s;
-  let y = H - padY - totalH;
-
-  const barTop = y + 4 * s;
-  const barH = Math.max(totalH - 8 * s, 6 * s);
-  ctx.save();
-  const g = ctx.createLinearGradient(0, barTop, 0, barTop + barH);
-  g.addColorStop(0, '#ffd24a');
-  g.addColorStop(1, 'rgba(255,210,74,.4)');
-  ctx.fillStyle = g;
-  roundRect(ctx, padX, barTop, 7 * s, barH, 3.5 * s);
-  ctx.fill();
-  ctx.restore();
-
-  ctx.textBaseline = 'top';
-  ctx.shadowColor = 'rgba(0,0,0,.62)';
-  ctx.shadowBlur = 12 * s;
-  ctx.shadowOffsetY = 2 * s;
-  for (const l of L) {
-    setFont(ctx, l.size, l.weight);
-    const isCode = l.t.startsWith('验真码');
-    ctx.fillStyle = l.weight >= 700 ? '#ffffff' : (isCode ? 'rgba(255,210,74,.95)' : 'rgba(255,255,255,.95)');
-    ctx.fillText(truncate(ctx, l.t, maxW), textX, y);
-    y += l.size * LINE_H + l.gap;
+function stopStream() {
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
   }
-  ctx.shadowColor = 'transparent';
-  ctx.shadowBlur = 0;
-  ctx.shadowOffsetY = 0;
+  trackRef = null;
+  imageCapture = null;
 }
 
-/* ---------- 样式二：半透明卡片 ---------- */
-function drawCard(ctx, W, H, d) {
-  const s = W / 1080;
-  const L = buildLines(d, s);
-  if (!L.length) return;
-  const inner = 32 * s;
-  const totalH = blockHeight(L);
-  const lastGap = L[L.length - 1].gap;
-
-  let maxTextW = 0;
-  for (const l of L) {
-    setFont(ctx, l.size, l.weight);
-    maxTextW = Math.max(maxTextW, ctx.measureText(l.t).width);
-  }
-  const boxW = Math.min(maxTextW + inner * 2, W - 88 * s);
-  const boxH = totalH - lastGap + inner * 2;
-  const x = 44 * s;
-  const y = H - 48 * s - boxH;
-
-  ctx.save();
-  roundRect(ctx, x, y, boxW, boxH, 24 * s);
-  ctx.fillStyle = 'rgba(10,12,16,.46)';
-  ctx.fill();
-  ctx.lineWidth = Math.max(1, 1.4 * s);
-  ctx.strokeStyle = 'rgba(255,255,255,.16)';
-  ctx.stroke();
-  ctx.restore();
-
-  let ty = y + inner;
-  ctx.textBaseline = 'top';
-  const maxW = boxW - inner * 2;
-  for (const l of L) {
-    setFont(ctx, l.size, l.weight);
-    const isCode = l.t.startsWith('验真码');
-    ctx.fillStyle = l.weight >= 700 ? '#ffffff' : (isCode ? 'rgba(255,210,74,.95)' : 'rgba(255,255,255,.92)');
-    ctx.fillText(truncate(ctx, l.t, maxW), x + inner, ty);
-    ty += l.size * LINE_H + l.gap;
-  }
+function qualityConstraint() {
+  return S.quality === 'high'
+    ? { width: { ideal: 2560 }, height: { ideal: 1920 } }
+    : { width: { ideal: 1920 }, height: { ideal: 1440 } };
 }
 
-/* ---------- 样式三：大字时间 ---------- */
-function drawHero(ctx, W, H, d) {
-  const s = W / 1080;
-  const L = [];
-  if (d.title) L.push({ t: d.title, size: 38 * s, weight: 700, gap: 8 * s });
-  if (S.showPlace && d.location) L.push({ t: d.location, size: 33 * s, weight: 500, gap: 4 * s });
-  if (S.showCoords && d.coords) L.push({ t: d.coords, size: 28 * s, weight: 500, gap: 8 * s });
-  if (S.showTime && d.dateLine) {
-    const t = (S.showWeather && d.weather) ? `${d.dateLine} · ${d.weather}` : d.dateLine;
-    L.push({ t, size: 29 * s, weight: 500, gap: 6 * s });
-  } else if (S.showWeather && d.weather) {
-    L.push({ t: d.weather, size: 29 * s, weight: 500, gap: 6 * s });
+async function startCamera(deviceId, opts) {
+  const keepLenses = !!(opts && opts.keepLenses);
+  if (typeof deviceId !== 'string') deviceId = null;
+  hideGuard();
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showGuard('当前环境不支持直接调用相机。点左下角「相册」可以导入照片加印。', '重试');
+    return false;
   }
-  if (S.showTime && d.timeHM) L.push({ t: d.timeHM, size: 116 * s, weight: 800, gap: 4 * s });
-  if (S.showCode && d.code) L.push({ t: '验真码 ' + d.code, size: 27 * s, weight: 600, gap: 0 });
-  if (!L.length) return;
 
-  const padX = 56 * s;
-  const padY = 64 * s;
-  const totalH = blockHeight(L);
-  const maxW = W - padX * 2;
-  let y = H - padY - totalH;
+  stopStream();
+  try {
+    const video0 = Object.assign({}, qualityConstraint());
+    if (deviceId) video0.deviceId = { exact: deviceId };
+    else video0.facingMode = { ideal: facing };
 
-  ctx.textBaseline = 'top';
-  ctx.shadowColor = 'rgba(0,0,0,.66)';
-  ctx.shadowBlur = 14 * s;
-  ctx.shadowOffsetY = 2 * s;
-  for (const l of L) {
-    setFont(ctx, l.size, l.weight);
-    const isCode = l.t.startsWith('验真码');
-    ctx.fillStyle = l.weight >= 800 ? '#ffffff' : (isCode ? 'rgba(255,210,74,.95)' : 'rgba(255,255,255,.94)');
-    ctx.fillText(truncate(ctx, l.t, maxW), padX, y);
-    y += l.size * LINE_H + l.gap;
-  }
-  ctx.shadowColor = 'transparent';
-  ctx.shadowBlur = 0;
-  ctx.shadowOffsetY = 0;
-}
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: video0 });
+    const track = stream.getVideoTracks()[0];
+    trackRef = track;
+    const st = (track.getSettings && track.getSettings()) || {};
+    curDeviceId = st.deviceId || deviceId || null;
+    if (st.facingMode) facing = st.facingMode;
+    caps = (track.getCapabilities && track.getCapabilities()) || {};
 
-/* ---------- 样式四：记录条（左大时间 + 右信息列） ---------- */
-function drawLog(ctx, W, H, d) {
-  const s = W / 1080;
-  const padX = 54 * s;
-  const padY = 62 * s;
-  const timeSize = 72 * s;
-  const dateSize = 26 * s;
-  const smallSize = 25 * s;
+    try { imageCapture = (typeof ImageCapture !== 'undefined') ? new ImageCapture(track) : null; } catch (e) { imageCapture = null; }
 
-  const R = [];
-  if (S.showPlace && d.location) R.push({ t: d.location, size: smallSize, weight: 500, gap: 8 * s });
-  if (S.showCoords && d.coords) R.push({ t: d.coords, size: 23 * s, weight: 500, gap: 8 * s });
-  if (S.showWeather && d.weather) R.push({ t: d.weather, size: 23 * s, weight: 500, gap: 8 * s });
-  if (S.showCode && d.code) R.push({ t: '验真码 ' + d.code, size: 22 * s, weight: 600, gap: 0 });
+    zoom = { type: 'none', v: 1 };
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    applyVideoTransform();
+    layoutStage();
+    applyEv(S.ev);
 
-  setFont(ctx, timeSize, 800);
-  const timeW = (S.showTime && d.timeHM) ? ctx.measureText(d.timeHM).width : 0;
-  setFont(ctx, dateSize, 500);
-  const dateW = (S.showTime && d.dateLine) ? ctx.measureText(d.dateLine).width : 0;
-  setFont(ctx, 40 * s, 700);
-  const titleW = d.title ? ctx.measureText(d.title).width : 0;
-  const leftW = Math.min(Math.max(timeW, dateW, S.showTime ? 0 : titleW), W * 0.46);
+    if (!keepLenses) await scanLenses(track);
+    else renderLensBar();
 
-  let rightH = 0;
-  for (const l of R) rightH += l.size * 1.3 + l.gap;
-
-  const leftH = (S.showTime ? timeSize * 0.98 + 14 * s + dateSize * 1.2 : 0);
-  const blockH = Math.max(leftH, rightH);
-  const top = H - padY - blockH;
-
-  ctx.textBaseline = 'top';
-  ctx.shadowColor = 'rgba(0,0,0,.66)';
-  ctx.shadowBlur = 14 * s;
-  ctx.shadowOffsetY = 2 * s;
-
-  let leftWritten = false;
-  if (S.showTime && d.timeHM) {
-    setFont(ctx, timeSize, 800);
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(truncate(ctx, d.timeHM, leftW), padX, top);
-    if (d.dateLine) {
-      setFont(ctx, dateSize, 500);
-      ctx.fillStyle = 'rgba(255,255,255,.86)';
-      ctx.fillText(truncate(ctx, d.dateLine, leftW), padX + 2 * s, top + timeSize * 0.98 + 14 * s);
+    updateToolCaps();
+    return true;
+  } catch (err) {
+    const name = (err && err.name) || '';
+    if (name === 'NotAllowedError' || name === 'SecurityError') {
+      showGuard('相机权限被拒绝。请在系统设置或浏览器权限里允许「相机」，然后点重试。', '重试');
+    } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+      showGuard('没找到可用摄像头。可以点「相册」导入照片加印。', '重试');
+    } else {
+      showGuard('相机启动失败（' + (name || '未知') + '）。', '重试');
     }
-    leftWritten = true;
-  } else if (d.title) {
-    setFont(ctx, 40 * s, 700);
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(truncate(ctx, d.title, leftW), padX, top);
-    leftWritten = true;
+    return false;
+  }
+}
+
+/* 预览层变换：镜像 + 裁切变焦 */
+function applyVideoTransform() {
+  const parts = [];
+  if (facing === 'user') parts.push('scaleX(-1)');
+  if (zoom.type === 'crop' && zoom.v > 1) parts.push('scale(' + zoom.v + ')');
+  video.style.transformOrigin = '50% 50%';
+  video.style.transform = parts.join(' ') || 'none';
+}
+
+/* ---------- 镜头扫描（沿用 v1.2 的逻辑） ---------- */
+function facingOfDevice(d) {
+  const l = (d && d.label ? d.label : '').toLowerCase();
+  if (/back|rear|environment|后置|背面/.test(l)) return 'environment';
+  if (/front|user|前置|正面/.test(l)) return 'user';
+  return null;
+}
+function focalToLabel(ratio) {
+  const std = [0.5, 0.6, 1, 2, 3, 5, 10];
+  let best = std[0];
+  for (const v of std) if (Math.abs(v - ratio) < Math.abs(best - ratio)) best = v;
+  return (best % 1 === 0 ? best : best.toFixed(1)) + '×';
+}
+
+async function probeCamera(deviceId) {
+  let s = null;
+  try {
+    s = await navigator.mediaDevices.getUserMedia({ audio: false, video: { deviceId: { exact: deviceId } } });
+    const t = s.getVideoTracks()[0];
+    const c = (t.getCapabilities && t.getCapabilities()) || {};
+    const st = (t.getSettings && t.getSettings()) || {};
+    return { focal: c.focalLengthX || st.focalLengthX || 0, facing: st.facingMode || null };
+  } catch (e) {
+    return null;
+  } finally {
+    if (s) s.getTracks().forEach(x => x.stop());
+  }
+}
+
+async function scanLenses(track) {
+  lensList = [];
+  lensIndex = 0;
+  lensMode = 'none';
+  zoom = { type: 'none', v: 1 };
+  applyVideoTransform();
+  renderLensBar();
+  if (!track) return;
+
+  const c = (track.getCapabilities && track.getCapabilities()) || {};
+  const sets = (track.getSettings && track.getSettings()) || {};
+
+  let cams = [];
+  try {
+    cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput' && d.deviceId);
+  } catch (e) { cams = []; }
+
+  let same = cams.filter(d => facingOfDevice(d) === facing);
+  if (!same.length) {
+    const cur = cams.find(d => d.deviceId === curDeviceId);
+    same = cur ? [cur] : [];
   }
 
-  if (!R.length) {
-    ctx.shadowColor = 'transparent';
-    ctx.shadowBlur = 0;
-    ctx.shadowOffsetY = 0;
+  // ① 同朝向多摄 → 物理镜头切换
+  if (same.length >= 2) {
+    const backup = curDeviceId;
+    const ownFocal = c.focalLengthX || sets.focalLengthX || 0;
+    stopStream();
+    const list = [];
+    for (const d of same) {
+      if (d.deviceId === backup && ownFocal) { list.push({ deviceId: d.deviceId, focal: ownFocal }); continue; }
+      const r = await probeCamera(d.deviceId);
+      if (!r) continue;
+      if (r.facing && r.facing !== facing) continue;
+      list.push({ deviceId: d.deviceId, focal: r.focal });
+    }
+    const reopened = await startCamera(backup, { keepLenses: true });
+
+    if (list.length >= 2 && reopened) {
+      if (list.every(x => x.focal > 0)) {
+        const asc = list.map(x => x.focal).sort((a, b) => a - b);
+        const base = asc[Math.floor(asc.length / 2)];
+        list.sort((a, b) => a.focal - b.focal);
+        lensList = list.map((x, i) => ({ key: 'dev' + i, label: focalToLabel(x.focal / base), deviceId: x.deviceId, zoom: null }));
+      } else {
+        lensList = list.map((x, i) => ({ key: 'dev' + i, label: (i + 1) + '×', deviceId: x.deviceId, zoom: null }));
+      }
+      const used = {};
+      lensList.forEach(l => {
+        if (used[l.label]) l.label = (parseFloat(l.label) + 0.5).toFixed(1) + '×';
+        used[l.label] = 1;
+      });
+      lensMode = 'optical';
+      const found = lensList.findIndex(l => l.deviceId === curDeviceId);
+      lensIndex = found >= 0 ? found : 0;
+      renderLensBar();
+      return;
+    }
+    if (!reopened) return;
+  }
+
+  // ② 传感器缩放
+  const zmax = (c.zoom && c.zoom.max) || 0;
+  if (zmax >= 1.9) {
+    const max = Math.min(zmax, 8);
+    const steps = [1, 2, 3, 5].filter(z => z <= max + 0.01);
+    if (steps.length >= 2) {
+      lensMode = 'zoom';
+      lensList = steps.map(z => ({ key: 'zoom' + z, label: z + '×', deviceId: null, zoom: z }));
+      lensIndex = 0;
+      renderLensBar();
+      return;
+    }
+  }
+
+  // ③ 画面裁切兜底
+  if (facing === 'environment' && (video.videoWidth || 0) >= 1280) {
+    lensMode = 'crop';
+    lensList = [1, 2, 3].map(z => ({ key: 'crop' + z, label: z + '×', deviceId: null, zoom: null, crop: z }));
+    lensIndex = 0;
+    renderLensBar();
+  }
+}
+
+function renderLensBar() {
+  const bar = $('#lensBar');
+  if (!bar) return;
+  if (lensList.length < 2) {
+    bar.hidden = true;
+    bar.innerHTML = '';
+    return;
+  }
+  bar.hidden = false;
+  bar.innerHTML = lensList.map((l, i) =>
+    `<button class="lens${i === lensIndex ? ' active' : ''}" data-i="${i}">${l.label}</button>`
+  ).join('');
+}
+
+function cropFallback(target) {
+  lensMode = 'crop';
+  lensList = [1, 2, 3].map(z => ({ key: 'crop' + z, label: z + '×', deviceId: null, zoom: null, crop: z }));
+  const i = lensList.findIndex(l => l.crop === target);
+  lensIndex = i >= 0 ? i : 0;
+  zoom = { type: 'crop', v: lensList[lensIndex].crop };
+  applyVideoTransform();
+  renderLensBar();
+}
+
+async function setLens(i) {
+  if (!lensList[i] || i === lensIndex) return;
+  const l = lensList[i];
+  const prev = lensIndex;
+  lensIndex = i;
+  renderLensBar();
+
+  if (l.crop != null) {
+    zoom = { type: 'crop', v: l.crop };
+    applyVideoTransform();
     return;
   }
 
-  const lineX = leftWritten ? padX + leftW + 30 * s : padX;
-  if (leftWritten && blockH > 30 * s) {
-    ctx.save();
-    ctx.shadowColor = 'transparent';
-    ctx.shadowBlur = 0;
-    const lg = ctx.createLinearGradient(0, top, 0, top + blockH);
-    lg.addColorStop(0, 'rgba(255,210,74,.9)');
-    lg.addColorStop(1, 'rgba(255,210,74,.15)');
-    ctx.fillStyle = lg;
-    roundRect(ctx, lineX, top + 4 * s, 3 * s, blockH - 8 * s, 1.5 * s);
-    ctx.fill();
-    ctx.restore();
+  if (l.zoom != null) {
+    const t = trackRef;
+    try {
+      if (!t) throw new Error('no track');
+      await t.applyConstraints({ advanced: [{ zoom: l.zoom }] });
+      const got = (t.getSettings && t.getSettings().zoom);
+      if (got == null || Math.abs(got - l.zoom) > 0.02) throw new Error('zoom-ignored');
+      zoom = { type: 'sensor', v: got || l.zoom };
+      applyVideoTransform();
+    } catch (e) {
+      cropFallback(Math.min(3, Math.max(2, Math.round(l.zoom))));
+      toast('已切换为数码变焦');
+    }
+    return;
   }
 
-  const rx = lineX + 26 * s;
-  const maxW = W - padX - rx;
-  let ry = top;
-  for (const l of R) {
-    setFont(ctx, l.size, l.weight);
-    ctx.fillStyle = l.t.startsWith('验真码') ? 'rgba(255,210,74,.95)' : 'rgba(255,255,255,.94)';
-    ctx.fillText(truncate(ctx, l.t, maxW), rx, ry);
-    ry += l.size * 1.3 + l.gap;
+  const ok = await startCamera(l.deviceId, { keepLenses: true });
+  if (!ok) {
+    lensIndex = prev;
+    renderLensBar();
+    toast('切换镜头失败');
   }
-
-  ctx.shadowColor = 'transparent';
-  ctx.shadowBlur = 0;
-  ctx.shadowOffsetY = 0;
 }
 
-/* ---------- 样式五：底部横幅（雾面玻璃带） ---------- */
-function drawTag(ctx, W, H, d) {
-  const s = W / 1080;
-  const padX = 40 * s;
-  const boxW = W - padX * 2;
-  const boxH = 156 * s;
-  const y = H - 44 * s - boxH;
+/* ---------- 双指缩放 ---------- */
+let pinchStart = 0;
+let pinchBase = 1;
 
-  ctx.save();
-  roundRect(ctx, padX, y, boxW, boxH, 24 * s);
-  const g = ctx.createLinearGradient(0, y, 0, y + boxH);
-  g.addColorStop(0, 'rgba(9,11,15,.58)');
-  g.addColorStop(1, 'rgba(9,11,15,.36)');
-  ctx.fillStyle = g;
-  ctx.fill();
-  ctx.lineWidth = Math.max(1, 1.4 * s);
-  ctx.strokeStyle = 'rgba(255,255,255,.16)';
-  ctx.stroke();
+stage.addEventListener('touchstart', e => {
+  if (e.touches.length !== 2) return;
+  pinchStart = Math.hypot(
+    e.touches[0].clientX - e.touches[1].clientX,
+    e.touches[0].clientY - e.touches[1].clientY
+  );
+  pinchBase = zoom.v || 1;
+}, { passive: true });
 
-  ctx.save();
-  roundRect(ctx, padX + 2 * s, y + 2 * s, boxW - 4 * s, boxH - 4 * s, 22 * s);
-  ctx.clip();
-  const hl = ctx.createLinearGradient(0, y, 0, y + 70 * s);
-  hl.addColorStop(0, 'rgba(255,255,255,.16)');
-  hl.addColorStop(1, 'rgba(255,255,255,0)');
-  ctx.fillStyle = hl;
-  ctx.fillRect(padX, y, boxW, 70 * s);
-  ctx.restore();
-  ctx.restore();
+stage.addEventListener('touchmove', e => {
+  if (e.touches.length !== 2 || !pinchStart) return;
+  const d = Math.hypot(
+    e.touches[0].clientX - e.touches[1].clientX,
+    e.touches[0].clientY - e.touches[1].clientY
+  );
+  const want = Math.min(8, Math.max(1, pinchBase * (d / pinchStart)));
+  if (Math.abs(want - (zoom.v || 1)) < 0.06) return;
+  applyZoom(want);
+}, { passive: true });
 
-  const tX = padX + 32 * s;
-  const dividerX = padX + boxW * 0.47;
-  const leftMaxW = dividerX - tX - 20 * s;
-  ctx.textBaseline = 'top';
-  let hasLeft = false;
-  if (S.showTime && d.timeHM) {
-    setFont(ctx, 52 * s, 800);
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(truncate(ctx, d.timeHM, leftMaxW), tX, y + 36 * s);
-    hasLeft = true;
+stage.addEventListener('touchend', () => { pinchStart = 0; }, { passive: true });
+
+async function applyZoom(z) {
+  const t = trackRef;
+  const cz = caps.zoom;
+  if (cz && t && z >= 1) {
+    try {
+      await t.applyConstraints({ advanced: [{ zoom: Math.min(cz.max, Math.max(cz.min, z)) }] });
+      const got = t.getSettings().zoom;
+      if (got != null) {
+        zoom = { type: 'sensor', v: got };
+        applyVideoTransform();
+        return;
+      }
+    } catch (e) {}
   }
-  if (d.title && !hasLeft) {
-    setFont(ctx, 38 * s, 700);
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(truncate(ctx, d.title, leftMaxW), tX, y + 44 * s);
-    hasLeft = true;
-  }
-  if (hasLeft && (d.dateLine || (S.showWeather && d.weather))) {
-    const sub = [d.dateLine, S.showWeather ? d.weather : ''].filter(Boolean).join(' · ');
-    setFont(ctx, 22 * s, 500);
-    ctx.fillStyle = 'rgba(255,255,255,.72)';
-    ctx.fillText(truncate(ctx, sub, leftMaxW), tX + 3 * s, y + 106 * s);
-  }
-
-  // 中间分隔
-  ctx.save();
-  roundRect(ctx, dividerX, y + 30 * s, 2 * s, boxH - 60 * s, 1 * s);
-  ctx.fillStyle = 'rgba(255,255,255,.16)';
-  ctx.fill();
-  ctx.restore();
-
-  // 右侧信息
-  const rLines = [];
-  if (S.showPlace && d.location) rLines.push({ t: d.location, size: 25 * s, weight: 500 });
-  if (S.showCoords && d.coords) rLines.push({ t: d.coords, size: 22 * s, weight: 500 });
-  if (S.showCode && d.code) rLines.push({ t: '验真码 ' + d.code, size: 22 * s, weight: 600 });
-  if (S.showWeather && d.weather && !(S.showTime && d.timeHM)) rLines.push({ t: d.weather, size: 23 * s, weight: 500 });
-
-  const rTotal = rLines.reduce((h, l) => h + l.size * 1.34, 0);
-  const rx = padX + boxW - 28 * s;
-  const maxW = rx - dividerX - 18 * s;
-  let ry = y + (boxH - rTotal) / 2;
-  ctx.textAlign = 'right';
-  for (const l of rLines) {
-    setFont(ctx, l.size, l.weight);
-    ctx.fillStyle = l.t.startsWith('验真码') ? 'rgba(255,210,74,.95)' : 'rgba(255,255,255,.92)';
-    ctx.fillText(truncate(ctx, l.t, maxW), rx, ry);
-    ry += l.size * 1.34;
-  }
-  ctx.textAlign = 'left';
+  zoom = { type: 'crop', v: z };
+  lensMode = 'crop';
+  applyVideoTransform();
 }
 
-/* ---------- 样式六：极简右下角 ---------- */
-function drawMinimal(ctx, W, H, d) {
-  const s = W / 1080;
-  const padX = 56 * s;
-  const padY = 64 * s;
+/* ---------- 触控对焦 ---------- */
+stage.addEventListener('click', e => {
+  if (!trackRef) return;
+  const r = stage.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width;
+  const y = (e.clientY - r.top) / r.height;
+  focusAt(x, y, e.clientX - r.left, e.clientY - r.top);
+});
 
-  const L = [];
-  if (S.showTime && d.timeText) L.push({ t: d.timeText, size: 30 * s, weight: 600, gap: 8 * s });
-  else if (d.title) L.push({ t: d.title, size: 30 * s, weight: 600, gap: 8 * s });
+let focusLocked = false;
 
-  if (S.showPlace && d.location) {
-    const t = (S.showWeather && d.weather) ? `${d.location}  ${d.weather}` : d.location;
-    L.push({ t, size: 23 * s, weight: 400, gap: 6 * s });
-  } else if (S.showWeather && d.weather) {
-    L.push({ t: d.weather, size: 23 * s, weight: 400, gap: 6 * s });
+async function focusAt(x, y, px, py) {
+  const ring = $('#focusRing');
+  if (ring) {
+    ring.style.left = px + 'px';
+    ring.style.top = py + 'px';
+    ring.classList.remove('run');
+    void ring.offsetWidth;
+    ring.classList.add('run');
   }
-  if (S.showCoords && d.coords) L.push({ t: d.coords, size: 21 * s, weight: 400, gap: 6 * s });
-  if (S.showCode && d.code) L.push({ t: '验真码 ' + d.code, size: 20 * s, weight: 500, gap: 0 });
-  if (!L.length) return;
-
-  const totalH = blockHeight(L);
-  const endY = H - padY;
-  const startY = endY - totalH;
-
-  ctx.textAlign = 'right';
-  ctx.textBaseline = 'top';
-  ctx.shadowColor = 'rgba(0,0,0,.7)';
-  ctx.shadowBlur = 12 * s;
-  ctx.shadowOffsetY = 1 * s;
-
-  let y = startY;
-  for (const l of L) {
-    setFont(ctx, l.size, l.weight);
-    ctx.fillStyle = l.t.startsWith('验真码')
-      ? 'rgba(255,210,74,.95)'
-      : (l.weight >= 600 ? 'rgba(255,255,255,.97)' : 'rgba(255,255,255,.8)');
-    ctx.fillText(truncate(ctx, l.t, W - padX * 2), W - padX, y);
-    y += l.size * LINE_H + l.gap;
-  }
-
-  ctx.shadowColor = 'transparent';
-  ctx.shadowBlur = 0;
-  ctx.shadowOffsetY = 0;
-
-  // 上方细线
-  ctx.fillStyle = 'rgba(255,255,255,.45)';
-  ctx.fillRect(W - padX - 46 * s, startY - 22 * s, 46 * s, Math.max(1.5, 2.4 * s));
-  ctx.textAlign = 'left';
+  const modes = (caps.focusMode || []);
+  try {
+    if (modes.includes('manual') || caps.pointsOfInterest) {
+      await trackRef.applyConstraints({ advanced: [{ pointsOfInterest: [{ x, y }] }] });
+    }
+    if (modes.includes('single-shot')) {
+      await trackRef.applyConstraints({ advanced: [{ focusMode: 'single-shot' }] });
+      setTimeout(() => {
+        trackRef.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
+      }, 1200);
+    }
+  } catch (e) {}
+  if (navigator.vibrate) navigator.vibrate(8);
 }
 
-function drawWatermark(ctx, W, H, d, styleId) {
-  const st = styleId || S.style;
-  ctx.save();
-  if (st === 'card') drawCard(ctx, W, H, d);
-  else if (st === 'hero') drawHero(ctx, W, H, d);
-  else if (st === 'strip' || st === 'log') drawLog(ctx, W, H, d);
-  else if (st === 'tag') drawTag(ctx, W, H, d);
-  else if (st === 'minimal') drawMinimal(ctx, W, H, d);
-  else drawClassic(ctx, W, H, d);
-  ctx.restore();
+/* ---------- 电筒 / 曝光 ---------- */
+async function toggleTorch() {
+  if (!trackRef) return;
+  const want = !torchOn;
+  try {
+    await trackRef.applyConstraints({ advanced: [{ torch: want }] });
+    torchOn = want;
+    toast(torchOn ? '补光灯已开' : '补光灯已关');
+  } catch (e) {
+    toast('这台设备不支持补光灯');
+    torchOn = false;
+  }
+  syncTools();
+}
+let torchOn = false;
+
+async function applyEv(v) {
+  if (!trackRef || !caps.exposureCompensation) return;
+  const r = caps.exposureCompensation;
+  const val = Math.min(r.max || 0, Math.max(r.min || 0, Number(v) || 0));
+  try { await trackRef.applyConstraints({ advanced: [{ exposureCompensation: val }] }); } catch (e) {}
+}
+
+function updateToolCaps() {
+  const t = $('#btnTorch');
+  if (t) t.hidden = !(caps.torch);
+  const ev = $('#evRow');
+  if (ev) ev.hidden = !caps.exposureCompensation;
 }
 
 /* ============================================================
-   数据
+   取景排版 / 实时水印
    ============================================================ */
-const geo = { lat: null, lng: null, acc: null, addr: '', weather: '' };
+function layoutStage() {
+  const cs = getComputedStyle(stageWrap);
+  const availW = stageWrap.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+  let availH = stageWrap.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+  const bar = $('.bars');
+  if (bar) availH -= bar.offsetHeight + 10;
+  if (availW <= 0 || availH <= 0) return;
+
+  const vw = video.videoWidth || 1080;
+  const vh = video.videoHeight || 1440;
+  const ratio = vw / vh;
+
+  let w = availW;
+  let h = w / ratio;
+  if (h > availH) { h = availH; w = h * ratio; }
+  stage.style.width = Math.round(w) + 'px';
+  stage.style.height = Math.round(h) + 'px';
+  renderOverlay();
+}
+
+let uiCode = '';
+
+function renderOverlay() {
+  const W = stage.clientWidth;
+  const H = stage.clientHeight;
+  if (!W || !H || !video.videoWidth || document.hidden) return;
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const pw = Math.round(W * dpr);
+  const ph = Math.round(H * dpr);
+  if (overlay.width !== pw || overlay.height !== ph) {
+    overlay.width = pw;
+    overlay.height = ph;
+    overlay.style.width = W + 'px';
+    overlay.style.height = H + 'px';
+  }
+  const ctx = overlay.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const d = WM.buildData(liveBase(), S, uiCode);
+  // 取景器里底图就是视频，亮度直接从 video 采样
+  let ink = 'dark';
+  if (S.autoInk) {
+    try { ink = sampleVideoInk(S.pos); } catch (e) { ink = 'dark'; }
+  }
+  WM.draw(ctx, W, H, d, { style: S.style, pos: S.pos, scale: S.wmScale, ink, s: S });
+}
+
+let inkCanvas = null;
+function sampleVideoInk(pos) {
+  if (!video.videoWidth) return 'dark';
+  if (!inkCanvas) {
+    inkCanvas = document.createElement('canvas');
+    inkCanvas.width = 24;
+    inkCanvas.height = 16;
+  }
+  const c = inkCanvas.getContext('2d', { willReadFrequently: true });
+  // 与水印区域对应的源区域
+  const bandH = Math.round(video.videoHeight * 0.34);
+  const sy = pos === 'top' ? 0 : video.videoHeight - bandH;
+  c.drawImage(video, 0, sy, video.videoWidth, bandH, 0, 0, 24, 16);
+  const px = c.getImageData(0, 0, 24, 16).data;
+  let sum = 0;
+  for (let i = 0; i < px.length; i += 4) sum += 0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2];
+  return (sum / (px.length / 4) / 255) > 0.62 ? 'light' : 'dark';
+}
+
+async function refreshUiCode() {
+  try {
+    const pub = await WMC.getPublic();
+    const b = liveBase();
+    const core = { v: 1, kid: pub.kid, ts: b.time.toISOString(), lat: b.lat, lng: b.lng, src: b.src, addr: b.addr || '' };
+    const c = await WMC.makeCode(core);
+    if (c !== uiCode) { uiCode = c; renderOverlay(); }
+  } catch (e) {}
+}
+
+/* ============================================================
+   数据 / 坐标
+   ============================================================ */
+const geo = { lat: null, lng: null, acc: null, alt: null, addr: '', weather: '' };
 
 function liveBase() {
   return {
     time: new Date(),
     lat: geo.lat,
     lng: geo.lng,
+    acc: geo.acc,
+    altitude: geo.alt,
     addr: (S.place || '').trim() || geo.addr || '',
     weather: geo.weather || '',
     src: 'live'
   };
 }
 
-/* WGS-84 → GCJ-02（高德/腾讯 用的火星坐标） */
+/* WGS-84 → GCJ-02 */
 function wgs84ToGcj02(lat, lng) {
   const a = 6378245.0, ee = 0.00669342162296594323;
-  function outOfChina(la, ln) {
-    return !(ln > 73.66 && ln < 135.05 && la > 3.86 && la < 53.55);
-  }
+  const outOfChina = (la, ln) => !(ln > 73.66 && ln < 135.05 && la > 3.86 && la < 53.55);
   function tLat(x, y) {
     let r = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
     r += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0;
@@ -508,432 +631,213 @@ function wgs84ToGcj02(lat, lng) {
   return [lat + dLat, lng + dLng];
 }
 
-function fmtCoords(lat, lng) {
-  if (lat == null || lng == null) return '';
-  let a = lat, b = lng, tag = '';
-  if (S.coordGcj) {
-    const g = wgs84ToGcj02(lat, lng);
-    a = g[0]; b = g[1];
-    tag = ' GCJ-02';
-  }
-  return `${a >= 0 ? '北纬' : '南纬'} ${Math.abs(a).toFixed(6)}°  ${b >= 0 ? '东经' : '西经'} ${Math.abs(b).toFixed(6)}°${tag}`;
-}
-
-function buildData(base, code) {
-  const t = base.time instanceof Date ? base.time : new Date();
-  const week = '日一二三四五六'[t.getDay()];
-  const hm = `${pad2(t.getHours())}:${pad2(t.getMinutes())}`;
-  const sec = S.showSeconds ? ':' + pad2(t.getSeconds()) : '';
-  const datePart = `${t.getFullYear()}-${pad2(t.getMonth() + 1)}-${pad2(t.getDate())}`;
-  const timeText = `${datePart} ${hm}${sec} 周${week}`;
-  const dateLine = `${t.getFullYear()}年${pad2(t.getMonth() + 1)}月${pad2(t.getDate())}日 周${week}`;
-  return {
-    title: (S.title || '').trim(),
-    timeText,
-    dateLine,
-    timeHM: hm + sec,
-    location: base.addr || '',
-    coords: fmtCoords(base.lat, base.lng),
-    weather: base.weather || '',
-    code: code || ''
-  };
+/* 打出水印时用的坐标（按设置转 GCJ-02） */
+function displayCoords() {
+  if (geo.lat == null) return { lat: null, lng: null };
+  if (!S.coordGcj) return { lat: geo.lat, lng: geo.lng };
+  const g = wgs84ToGcj02(geo.lat, geo.lng);
+  return { lat: g[0], lng: g[1] };
 }
 
 /* ============================================================
-   取景器排版 / 实时水印
+   拍摄流水线
    ============================================================ */
-function layoutStage() {
-  const cs = getComputedStyle(stageWrap);
-  const availW = stageWrap.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
-  let availH = stageWrap.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
-  const bar = document.querySelector('.stylebar');
-  if (bar) availH -= bar.offsetHeight + 10;
-  if (availW <= 0 || availH <= 0) return;
+function nextFrame() {
+  return new Promise(res => {
+    if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(() => res());
+    else setTimeout(res, 90);
+  });
+}
 
-  const vw = video.videoWidth || 1080;
-  const vh = video.videoHeight || 1440;
-  const ratio = vw / vh;
+function grabFrame() {
+  const W = video.videoWidth, H = video.videoHeight;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  c.getContext('2d').drawImage(video, 0, 0, W, H);
+  return c;
+}
 
-  let w = availW;
-  let h = w / ratio;
-  if (h > availH) {
-    h = availH;
-    w = h * ratio;
+/* 清晰度评分：灰度拉普拉斯方差，越大越清晰 */
+function sharpness(canvas) {
+  const sw = 320, sh = Math.max(1, Math.round(320 * canvas.height / canvas.width));
+  const c = document.createElement('canvas');
+  c.width = sw; c.height = sh;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(canvas, 0, 0, sw, sh);
+  const d = ctx.getImageData(0, 0, sw, sh).data;
+  const g = new Float32Array(sw * sh);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    g[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
   }
-  stage.style.width = Math.round(w) + 'px';
-  stage.style.height = Math.round(h) + 'px';
-  renderOverlay();
-}
-
-let uiCode = '';
-
-function renderOverlay() {
-  const W = stage.clientWidth;
-  const H = stage.clientHeight;
-  if (!W || !H || !video.videoWidth || document.hidden) return;
-
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const pw = Math.round(W * dpr);
-  const ph = Math.round(H * dpr);
-  if (overlay.width !== pw || overlay.height !== ph) {
-    overlay.width = pw;
-    overlay.height = ph;
-    overlay.style.width = W + 'px';
-    overlay.style.height = H + 'px';
-  }
-  const ctx = overlay.getContext('2d');
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, W, H);
-  drawWatermark(ctx, W, H, buildData(liveBase(), uiCode));
-}
-
-async function refreshUiCode() {
-  try {
-    const pub = await WMC.getPublic();
-    const b = liveBase();
-    const core = {
-      v: 1, kid: pub.kid, ts: b.time.toISOString(),
-      lat: b.lat, lng: b.lng, src: b.src, addr: b.addr || ''
-    };
-    const c = await WMC.makeCode(core);
-    if (c !== uiCode) {
-      uiCode = c;
-      renderOverlay();
-    }
-  } catch (e) {}
-}
-
-/* ============================================================
-   相机
-   ============================================================ */
-let stream = null;
-let facing = 'environment';
-
-/* 焦段：① 物理镜头（真光学）→ ② 传感器缩放 → ③ 画面裁切 */
-let lensList = [];
-let lensIndex = 0;
-let curDeviceId = null;
-let lensMode = 'none';   // optical | zoom | crop | none
-let zoomFactor = 1;
-
-function showGuard(text, btnLabel) {
-  guardText.textContent = text;
-  btnEnableCam.textContent = btnLabel || '重试';
-  guard.classList.add('show');
-}
-function hideGuard() {
-  guard.classList.remove('show');
-}
-function stopStream() {
-  if (stream) {
-    stream.getTracks().forEach(t => t.stop());
-    stream = null;
-  }
-}
-
-async function startCamera(deviceId, opts) {
-  const keepLenses = !!(opts && opts.keepLenses);
-  if (typeof deviceId !== 'string') deviceId = null;
-  hideGuard();
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showGuard('当前浏览器不支持直接调用相机。请用手机浏览器打开本页面，或点左下角「相册」导入照片加印。', '重试');
-    return false;
-  }
-  stopStream();
-  try {
-    const video0 = {
-      width: { ideal: 1920 },
-      height: { ideal: 1440 }
-    };
-    if (deviceId) video0.deviceId = { exact: deviceId };
-    else video0.facingMode = { ideal: facing };
-
-    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: video0 });
-    const track = stream.getVideoTracks()[0];
-    const st = (track && track.getSettings) ? track.getSettings() : {};
-    curDeviceId = st.deviceId || deviceId || null;
-    if (st.facingMode) facing = st.facingMode;
-
-    zoomFactor = 1;
-    video.srcObject = stream;
-    await video.play().catch(() => {});
-    applyVideoTransform();
-    layoutStage();
-
-    if (!keepLenses) {
-      await scanLenses(track);
-    } else {
-      renderLensBar();
-    }
-    return true;
-  } catch (err) {
-    const name = err && err.name ? err.name : '';
-    if (name === 'NotAllowedError' || name === 'SecurityError') {
-      showGuard('相机权限被拒绝。请在浏览器地址栏左侧的权限设置里允许「相机」，然后点重试。', '重试');
-    } else if (name === 'NotFoundError' || name === 'OverconstrainedError') {
-      showGuard('没有找到可用的摄像头。可以点左下角「相册」导入照片加印。', '重试');
-    } else {
-      showGuard('相机启动失败（' + (name || '未知错误') + '）。注意：网页相机必须在 HTTPS 环境下使用。', '重试');
-    }
-    return false;
-  }
-}
-
-/* 预览层的镜像 / 裁切缩放 */
-function applyVideoTransform() {
-  const parts = [];
-  if (facing === 'user') parts.push('scaleX(-1)');
-  if (lensMode === 'crop' && zoomFactor > 1) parts.push('scale(' + zoomFactor + ')');
-  video.style.transformOrigin = '50% 50%';
-  video.style.transform = parts.join(' ');
-}
-
-/* ---------- 焦段 ---------- */
-function facingOfDevice(d) {
-  const l = (d && d.label ? d.label : '').toLowerCase();
-  if (/back|rear|environment|后置|背面/.test(l)) return 'environment';
-  if (/front|user|前置|正面/.test(l)) return 'user';
-  return null;
-}
-function focalToLabel(ratio) {
-  const std = [0.5, 0.6, 1, 2, 3, 5, 10];
-  let best = std[0];
-  for (const v of std) if (Math.abs(v - ratio) < Math.abs(best - ratio)) best = v;
-  return (best % 1 === 0 ? best : best.toFixed(1)) + '×';
-}
-
-/* 打开某个摄像头读焦距后立刻关闭；失败返回 null */
-async function probeCamera(deviceId) {
-  let s = null;
-  try {
-    s = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { deviceId: { exact: deviceId } }
-    });
-    const t = s.getVideoTracks()[0];
-    const c = (t && t.getCapabilities) ? t.getCapabilities() : {};
-    const st = (t && t.getSettings) ? t.getSettings() : {};
-    return { focal: c.focalLengthX || st.focalLengthX || 0, facing: st.facingMode || null };
-  } catch (e) {
-    return null;
-  } finally {
-    if (s) s.getTracks().forEach(x => x.stop());
-  }
-}
-
-/* 扫描可用焦段：只有同朝向存在多个摄像头时才关预览逐个探测 */
-async function scanLenses(track) {
-  lensList = [];
-  lensIndex = 0;
-  lensMode = 'none';
-  zoomFactor = 1;
-  applyVideoTransform();
-  renderLensBar();
-  if (!track) return;
-
-  const caps = (track.getCapabilities && track.getCapabilities()) || {};
-  const sets = (track.getSettings && track.getSettings()) || {};
-
-  let cams = [];
-  try {
-    const all = await navigator.mediaDevices.enumerateDevices();
-    cams = all.filter(d => d.kind === 'videoinput' && d.deviceId);
-  } catch (e) { cams = []; }
-
-  // 严格只留当前朝向的摄像头；识别不出的不参与，避免把前后摄当焦段
-  let same = cams.filter(d => facingOfDevice(d) === facing);
-  if (!same.length) {
-    const cur = cams.find(d => d.deviceId === curDeviceId);
-    same = cur ? [cur] : [];
-  }
-
-  // ① 同朝向多摄 → 切物理镜头（真光学）
-  if (same.length >= 2) {
-    const backup = curDeviceId;
-    const ownFocal = caps.focalLengthX || sets.focalLengthX || 0;
-    // 安卓上第二个摄像头必须在主预览关闭后才有机会打开
-    stopStream();
-    const list = [];
-    for (const d of same) {
-      if (d.deviceId === backup && ownFocal) {
-        list.push({ deviceId: d.deviceId, focal: ownFocal });
-        continue;
-      }
-      const r = await probeCamera(d.deviceId);
-      if (!r) continue;
-      if (r.facing && r.facing !== facing) continue;
-      list.push({ deviceId: d.deviceId, focal: r.focal });
-    }
-    const reopened = await startCamera(backup, { keepLenses: true });
-
-    if (list.length >= 2 && reopened) {
-      if (list.every(x => x.focal > 0)) {
-        const asc = list.map(x => x.focal).sort((a, b) => a - b);
-        const base = asc[Math.floor(asc.length / 2)];   // 中位焦距 = 1×（主摄）
-        list.sort((a, b) => a.focal - b.focal);         // 广角 → 长焦
-        lensList = list.map((x, i) => ({
-          key: 'dev' + i, label: focalToLabel(x.focal / base), deviceId: x.deviceId, zoom: null
-        }));
-      } else {
-        lensList = list.map((x, i) => ({
-          key: 'dev' + i, label: (i + 1) + '×', deviceId: x.deviceId, zoom: null
-        }));
-      }
-      const used = {};
-      lensList.forEach(l => {
-        if (used[l.label]) l.label = (parseFloat(l.label) + 0.5).toFixed(1) + '×';
-        used[l.label] = 1;
-      });
-      lensMode = 'optical';
-      const found = lensList.findIndex(l => l.deviceId === curDeviceId);
-      lensIndex = found >= 0 ? found : 0;
-      renderLensBar();
-      return;
-    }
-    if (!reopened) return;
-  }
-
-  // ② 单摄：传感器缩放（部分机型变焦时会自动切到长焦镜头）
-  const zmax = (caps.zoom && caps.zoom.max) || 0;
-  if (zmax >= 1.9) {
-    const max = Math.min(zmax, 8);
-    const steps = [1, 2, 3, 5].filter(z => z <= max + 0.01);
-    if (steps.length >= 2) {
-      lensMode = 'zoom';
-      lensList = steps.map(z => ({ key: 'zoom' + z, label: z + '×', deviceId: null, zoom: z }));
-      lensIndex = 0;
-      renderLensBar();
-      return;
+  let sum = 0, sum2 = 0, n = 0;
+  for (let y = 1; y < sh - 1; y++) {
+    for (let x = 1; x < sw - 1; x++) {
+      const i = y * sw + x;
+      const v = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - sw] - g[i + sw];
+      sum += v; sum2 += v * v; n++;
     }
   }
-
-  // ③ 兜底：画面裁切（取景与成片同步放大）
-  if (facing === 'environment' && (video.videoWidth || 0) >= 1280) {
-    lensMode = 'crop';
-    lensList = [1, 2, 3].map(z => ({ key: 'crop' + z, label: z + '×', deviceId: null, zoom: null, crop: z }));
-    lensIndex = 0;
-    renderLensBar();
-  }
-}
-
-function renderLensBar() {
-  const bar = $('#lensBar');
-  if (!bar) return;
-  if (lensList.length < 2) {
-    bar.hidden = true;
-    bar.innerHTML = '';
-    return;
-  }
-  bar.hidden = false;
-  bar.innerHTML = lensList
-    .map((l, i) => `<button class="lens${i === lensIndex ? ' active' : ''}" data-i="${i}">${l.label}</button>`)
-    .join('');
-}
-
-/* 传感器缩放不被支持时，退回画面裁切档 */
-function cropFallback(target) {
-  lensMode = 'crop';
-  lensList = [1, 2, 3].map(z => ({ key: 'crop' + z, label: z + '×', deviceId: null, zoom: null, crop: z }));
-  const i = lensList.findIndex(l => l.crop === target);
-  lensIndex = i >= 0 ? i : 0;
-  zoomFactor = lensList[lensIndex].crop;
-  applyVideoTransform();
-  renderLensBar();
-}
-
-async function setLens(i) {
-  if (!lensList[i] || i === lensIndex) return;
-  const l = lensList[i];
-  const prev = lensIndex;
-  lensIndex = i;
-  renderLensBar();
-
-  // 裁切档：只改取景与成片的取景框
-  if (l.crop != null) {
-    zoomFactor = l.crop;
-    applyVideoTransform();
-    return;
-  }
-
-  // 传感器缩放档：应用后回读，确认设备真的换了倍率
-  if (l.zoom != null) {
-    const t = stream && stream.getVideoTracks()[0];
-    try {
-      if (!t) throw new Error('no track');
-      await t.applyConstraints({ advanced: [{ zoom: l.zoom }] });
-      const got = (t.getSettings && t.getSettings().zoom);
-      if (got == null || Math.abs(got - l.zoom) > 0.02) throw new Error('zoom-ignored');
-    } catch (e) {
-      cropFallback(Math.min(3, Math.max(2, Math.round(l.zoom))));
-      toast('已切换为数码变焦');
-    }
-    return;
-  }
-
-  // 物理镜头
-  const ok = await startCamera(l.deviceId, { keepLenses: true });
-  if (!ok) {
-    lensIndex = prev;
-    renderLensBar();
-    toast('切换镜头失败');
-  }
-}
-
-video.addEventListener('loadedmetadata', layoutStage);
-video.addEventListener('resize', layoutStage);
-
-/* ============================================================
-   签名出图
-   ============================================================ */
-function canvasToBlob(canvas, quality) {
-  return new Promise(res => canvas.toBlob(b => res(b), 'image/jpeg', quality || 0.94));
-}
-
-function devInfo() {
-  return {
-    ua: (navigator.userAgent || '').slice(0, 120),
-    w: video.videoWidth || 0,
-    h: video.videoHeight || 0,
-    dpr: window.devicePixelRatio || 1,
-    tz: (Intl.DateTimeFormat().resolvedOptions().timeZone || '') + '/' + new Date().getTimezoneOffset()
-  };
+  if (!n) return 0;
+  const mean = sum / n;
+  return sum2 / n - mean * mean;
 }
 
 /**
- * 在 canvas 上绘水印并生成带签名段的 JPEG
- * @param {HTMLCanvasElement} canvas 已绘制照片像素
- * @param {object} base {time, lat, lng, addr, weather, src}
+ * 取图：优先原生满幅，失败退预览帧（多帧择优）
+ * @returns {Promise<{src:CanvasImageSource,w:number,h:number,via:string,score:number}>}
  */
-async function processPhoto(canvas, base) {
-  const canSign = !!(window.WMC && window.crypto && window.crypto.subtle);
-  if (!canSign) {
-    // 非安全环境（如直接双击打开本地文件）无法调用 WebCrypto：只出图，不签名
-    const c0 = canvas.getContext('2d');
-    drawWatermark(c0, canvas.width, canvas.height, buildData(base, ''));
-    const b0 = await canvasToBlob(canvas, 0.94);
-    return { blob: b0, code: '', core: null, payload: null, unsigned: true };
+async function grabBestImage() {
+  // ① ImageCapture：拿到的是传感器满分辨率原图，画质最好
+  if (imageCapture && S.quality === 'high' && typeof imageCapture.takePhoto === 'function') {
+    try {
+      const blob = await imageCapture.takePhoto();
+      const bmp = await createImageBitmap(blob);
+      return { src: bmp, w: bmp.width, h: bmp.height, via: 'capture', score: 0 };
+    } catch (e) {
+      // 部分 WebView / 机型不支持，静默降级
+    }
   }
 
-  const pub = await WMC.getPublic();
-  const core = {
-    v: 1,
-    kid: pub.kid,
-    ts: (base.time instanceof Date ? base.time : new Date()).toISOString(),
-    lat: base.lat,
-    lng: base.lng,
-    src: base.src || 'live',
-    addr: base.addr || ''
-  };
-  const code = await WMC.makeCode(core);
+  // ② 预览帧：一次取多帧，取最清晰的那张，抵消手抖与对焦抖动
+  const n = S.smartPick ? 3 : 1;
+  const frames = [];
+  for (let i = 0; i < n; i++) {
+    await nextFrame();
+    frames.push(grabFrame());
+  }
+  let best = frames[0], bestScore = -1;
+  for (const f of frames) {
+    const sc = sharpness(f);
+    if (sc > bestScore) { bestScore = sc; best = f; }
+  }
+  return { src: best, w: best.width, h: best.height, via: 'video', score: bestScore };
+}
 
+/* cover 裁剪：让源图按目标比例居中裁切 */
+function coverRect(iw, ih, targetR) {
+  const ir = iw / ih;
+  if (ir > targetR) {
+    const w = ih * targetR;
+    return { x: (iw - w) / 2, y: 0, w, h: ih };
+  }
+  const h = iw / targetR;
+  return { x: 0, y: (ih - h) / 2, w: iw, h };
+}
+
+/**
+ * 合成画布：把取到的图按“所见即所得”画出来
+ * 预览里看到什么（含前置镜像、变焦裁切、比例裁切），成片就是什么
+ */
+function composeCanvas(raw) {
+  const vw = stage.clientWidth, vh = stage.clientHeight;
+  const targetR = (vw && vh) ? vw / vh : raw.w / raw.h;
+
+  const rect = coverRect(raw.w, raw.h, targetR);
+  const z = (zoom.type === 'crop' && zoom.v > 1) ? zoom.v : 1;
+  const zw = rect.w / z;
+  const zh = zw / targetR;
+  const zx = rect.x + (rect.w - zw) / 2;
+  const zy = rect.y + (rect.h - zh) / 2;
+
+  let outW = Math.round(zw);
+  let outH = Math.round(zh);
+  const MAXW = 4096;
+  if (outW > MAXW) {
+    outH = Math.round(outH * MAXW / outW);
+    outW = MAXW;
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = outW;
+  canvas.height = outH;
   const ctx = canvas.getContext('2d');
-  drawWatermark(ctx, canvas.width, canvas.height, buildData(base, code));
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, outW, outH);
+  ctx.imageSmoothingQuality = 'high';
 
-  const blob = await canvasToBlob(canvas, 0.94);
-  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (facing === 'user') {
+    ctx.translate(outW, 0);
+    ctx.scale(-1, 1);
+  }
+  ctx.drawImage(raw.src, zx, zy, zw, zh, 0, 0, outW, outH);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return canvas;
+}
+
+function canvasToBlob(canvas, quality) {
+  return new Promise(res => canvas.toBlob(b => res(b), 'image/jpeg', quality || S.jpegQuality));
+}
+
+/**
+ * 绘制水印 + 编码 + EXIF + 签名
+ * @param {HTMLCanvasElement} canvas 已绘制照片像素
+ * @param {object} base 拍摄信息
+ * @param {object} override 可选，临时覆盖设置（预览里换样式用）
+ */
+async function renderPhoto(canvas, base, override) {
+  const st = override ? Object.assign({}, S, override) : S;
+
+  const canSign = !!(window.WMC && window.crypto && window.crypto.subtle);
+  let code = '';
+  let core = null;
+
+  if (canSign) {
+    const pub = await WMC.getPublic();
+    core = {
+      v: 1,
+      kid: pub.kid,
+      ts: (base.time instanceof Date ? base.time : new Date()).toISOString(),
+      lat: base.lat,
+      lng: base.lng,
+      src: base.src || 'live',
+      addr: base.addr || ''
+    };
+    code = await WMC.makeCode(core);
+  }
+
+  // 取色 → 决定墨水
+  const ctx = canvas.getContext('2d');
+  let ink = 'dark';
+  if (st.autoInk) {
+    try { ink = WM.measureInk(ctx, canvas.width, canvas.height, st.pos === 'top' ? 'top' : 'bottom'); } catch (e) {}
+  }
+
+  const d = WM.buildData(base, st, code);
+  WM.draw(ctx, canvas.width, canvas.height, d, {
+    style: st.style, pos: st.pos, scale: st.wmScale, ink, s: st
+  });
+
+  let blob = await canvasToBlob(canvas, S.jpegQuality);
+  let bytes = new Uint8Array(await blob.arrayBuffer());
+
+  // 写入标准 EXIF（时间 / GPS / 机型 / 备注）
+  if (st.writeExif && window.WMCExifWrite) {
+    try {
+      bytes = WMCExifWrite.inject(bytes, {
+        time: base.time instanceof Date ? base.time : new Date(),
+        lat: base.lat,
+        lng: base.lng,
+        altitude: base.altitude,
+        make: 'WMC',
+        model: 'WMC Camera / ' + (navigator.platform || 'Android'),
+        software: 'Moment Camera ' + APP_VERSION,
+        description: 'Moment Camera · ' + d.timeText,
+        xpTitle: d.title || '此刻相机',
+        comment: '此刻相机' + (code ? ' · 验真码 ' + code : ''),
+        width: canvas.width,
+        height: canvas.height
+      });
+    } catch (e) {
+      // EXIF 写失败不影响出图
+    }
+  }
+
+  if (!canSign) {
+    return { blob: new Blob([bytes], { type: 'image/jpeg' }), code: '', core: null, unsigned: true, canvas };
+  }
+
   const imh = WMC.base32(await WMC.sha256(bytes), 26);
   const sig = await WMC.sign(core, code, imh);
-
   const payload = {
     wmc: 'WMC1',
     v: 1,
@@ -941,76 +845,148 @@ async function processPhoto(canvas, base) {
     code,
     imh,
     sig: WMC.toB64url(sig),
-    pub: pub.pub,
-    fp: pub.fp,
-    kid: pub.kid,
+    pub: (await WMC.getPublic()).pub,
+    fp: (await WMC.getPublic()).fp,
+    kid: core.kid,
     at: Date.now(),
-    dev: devInfo()
+    dev: devInfo(canvas)
   };
   const signed = WMC.jpeg.embed(bytes, payload);
-  return { blob: new Blob([signed], { type: 'image/jpeg' }), code, core, payload };
+  return { blob: new Blob([signed], { type: 'image/jpeg' }), code, core, payload, canvas, ink };
 }
 
-/* ---------- 预览 / 保存 ---------- */
+function devInfo(canvas) {
+  return {
+    ua: (navigator.userAgent || '').slice(0, 120),
+    w: canvas ? canvas.width : (video.videoWidth || 0),
+    h: canvas ? canvas.height : (video.videoHeight || 0),
+    dpr: window.devicePixelRatio || 1,
+    tz: (Intl.DateTimeFormat().resolvedOptions().timeZone || '') + '/' + new Date().getTimezoneOffset(),
+    ver: APP_VERSION
+  };
+}
+
+/* ---------- 快门 ---------- */
+let busy = false;
+let lastRaw = null;          // 上一张的原始画布（用于改水印重出图）
+let lastBase = null;
 let shotBlob = null;
 let shotCode = '';
+const history = [];          // 本次会话拍摄记录
 
-function showBusy(text) {
-  guardText.textContent = text || '处理中…';
-  guard.classList.add('show');
+function shutterFlash() {
+  const f = $('#flash');
+  if (!f) return;
+  f.classList.remove('run');
+  void f.offsetWidth;
+  f.classList.add('run');
 }
-function hideBusy() {
-  guard.classList.remove('show');
+
+async function countdown(sec) {
+  const el = $('#countdown');
+  if (!el) { await new Promise(r => setTimeout(r, sec * 1000)); return; }
+  el.hidden = false;
+  for (let i = sec; i > 0; i--) {
+    el.textContent = String(i);
+    el.classList.remove('run');
+    void el.offsetWidth;
+    el.classList.add('run');
+    if (navigator.vibrate) navigator.vibrate(30);
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  el.hidden = true;
 }
 
 async function capture() {
-  if (!video.videoWidth) {
-    toast('相机还没准备好');
-    return;
-  }
-  const W = video.videoWidth;
-  const H = video.videoHeight;
-  const canvas = document.createElement('canvas');
-  canvas.width = W;
-  canvas.height = H;
-  const ctx = canvas.getContext('2d');
-  if (facing === 'user') {
-    ctx.translate(W, 0);
-    ctx.scale(-1, 1);
-  }
-  // 裁切档：取中心区域放大，与取景器看到的一致
-  const z = (lensMode === 'crop' && zoomFactor > 1) ? zoomFactor : 1;
-  if (z > 1) {
-    const sw = Math.round(W / z);
-    const sh = Math.round(H / z);
-    ctx.drawImage(video, Math.round((W - sw) / 2), Math.round((H - sh) / 2), sw, sh, 0, 0, W, H);
-  } else {
-    ctx.drawImage(video, 0, 0, W, H);
-  }
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (busy) return;
+  if (!video.videoWidth) { toast('相机还没准备好'); return; }
+  busy = true;
+  const btn = $('#btnShutter');
+  if (btn) btn.disabled = true;
 
-  showBusy('正在签名…');
   try {
-    const r = await processPhoto(canvas, liveBase());
+    if (S.timer > 0) await countdown(S.timer);
+    shutterFlash();
+    showBusy('正在成像…');
+
+    const raw = await grabBestImage();
+    const base = liveBase();
+
+    // 坐标按设置转换
+    if (S.coordGcj && base.lat != null) {
+      const g = wgs84ToGcj02(base.lat, base.lng);
+      base.latGcj = g[0]; base.lngGcj = g[1];
+    }
+
+    const canvas = composeCanvas(raw);
+    lastRaw = canvas;
+    lastBase = base;
+
+    showBusy('正在签名…');
+    const r = await renderPhoto(canvas, base);
     shotBlob = r.blob;
     shotCode = r.code;
+
+    pushHistory(r.blob, r.code, base);
     openPreview(r.blob, r.code);
-    if (r.unsigned) toast('当前环境不支持签名（需 https），这张照片没有签名');
+    if (r.unsigned) toast('当前环境不支持签名（需 https），这张没有签名');
   } catch (e) {
-    toast('签名失败：' + (e && e.message ? e.message : e));
+    toast('拍摄失败：' + (e && e.message ? e.message : e));
   } finally {
     hideBusy();
+    busy = false;
+    if (btn) btn.disabled = false;
   }
 }
 
+/* ---------- 历史 ---------- */
+function pushHistory(blob, code, base) {
+  const url = URL.createObjectURL(blob);
+  history.unshift({
+    id: Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+    blob, url, code, time: new Date(),
+    w: lastRaw ? lastRaw.width : 0,
+    h: lastRaw ? lastRaw.height : 0
+  });
+  if (history.length > 24) {
+    const drop = history.pop();
+    URL.revokeObjectURL(drop.url);
+  }
+  renderHistory();
+}
+
+function renderHistory() {
+  const grid = $('#historyGrid');
+  if (!grid) return;
+  if (!history.length) {
+    grid.innerHTML = '<p class="empty">还没有拍摄记录。拍下的照片会暂时列在这里，方便挑选和批量保存。</p>';
+    $('#btnSaveAll').hidden = true;
+    return;
+  }
+  $('#btnSaveAll').hidden = false;
+  grid.innerHTML = history.map((h, i) =>
+    `<button class="shot" data-i="${i}">
+       <img src="${h.url}" alt="">
+       <span>${pad2(h.time.getHours())}:${pad2(h.time.getMinutes())}:${pad2(h.time.getSeconds())}</span>
+     </button>`
+  ).join('');
+}
+
+/* ============================================================
+   预览 / 保存
+   ============================================================ */
 function openPreview(blob, code) {
   const url = URL.createObjectURL(blob);
   const img = $('#previewImg');
   if (img.dataset.url) URL.revokeObjectURL(img.dataset.url);
   img.dataset.url = url;
   img.src = url;
-  $('#previewCode').textContent = code ? '验真码 ' + code : '';
+  $('#previewCode').textContent = code ? '验真码 ' + code : '（当前环境不支持签名）';
   $('#preview').classList.add('show');
+}
+
+function closePreview() {
+  $('#preview').classList.remove('show');
 }
 
 function stampName(prefix) {
@@ -1019,54 +995,84 @@ function stampName(prefix) {
   return `${prefix || '此刻'}_${ts}${shotCode ? '_' + shotCode.replace(/-/g, '') : ''}.jpg`;
 }
 
-async function saveShot() {
-  if (!shotBlob) return;
-  // 原生壳：走 Java 接口直接写入系统相册（WebView 不支持 blob 下载）
+async function saveBlob(blob, name) {
+  if (!blob) return false;
   if (window.WMCAndroid && typeof window.WMCAndroid.saveImage === 'function') {
     try {
       const dataUrl = await new Promise((res, rej) => {
         const fr = new FileReader();
         fr.onload = () => res(fr.result);
         fr.onerror = () => rej(new Error('读取图片失败'));
-        fr.readAsDataURL(shotBlob);
+        fr.readAsDataURL(blob);
       });
-      const r = String(window.WMCAndroid.saveImage(dataUrl, stampName('此刻')));
-      if (r.indexOf('OK') === 0) toast('已保存到相册 Pictures/此刻相机');
-      else toast('保存失败：' + r);
+      const r = String(window.WMCAndroid.saveImage(dataUrl, name));
+      return r.indexOf('OK') === 0;
     } catch (e) {
-      toast('保存失败：' + (e && e.message ? e.message : e));
+      return false;
     }
-    return;
   }
-  const url = URL.createObjectURL(shotBlob);
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = stampName('此刻');
+  a.download = name;
   document.body.appendChild(a);
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 8000);
-  toast('已保存 · 请用「原图/文件」方式转发，压缩会破坏签名');
+  return true;
+}
+
+async function saveShot() {
+  if (!shotBlob) return;
+  const ok = await saveBlob(shotBlob, stampName('此刻'));
+  toast(ok ? '已保存到 Pictures/此刻相机' : '保存失败');
+}
+
+async function saveAll() {
+  if (!history.length) return;
+  let ok = 0;
+  for (const h of history) {
+    const name = `此刻_${h.time.getFullYear()}${pad2(h.time.getMonth() + 1)}${pad2(h.time.getDate())}_${pad2(h.time.getHours())}${pad2(h.time.getMinutes())}${pad2(h.time.getSeconds())}${h.code ? '_' + h.code.replace(/-/g, '') : ''}.jpg`;
+    if (await saveBlob(h.blob, name)) ok++;
+  }
+  toast(`已保存 ${ok} / ${history.length} 张`);
 }
 
 async function shareShot() {
   if (!shotBlob) return;
   const file = new File([shotBlob], stampName('此刻'), { type: 'image/jpeg' });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
-    try {
-      await navigator.share({ files: [file], title: '此刻照片' });
-    } catch (e) {}
+    try { await navigator.share({ files: [file], title: '此刻照片' }); } catch (e) {}
   } else {
     saveShot();
+  }
+}
+
+/* 改水印重出图 */
+async function reRender() {
+  if (!lastRaw || !lastBase) { toast('没有可重出的照片'); return; }
+  busy = true;
+  showBusy('正在重新出图…');
+  try {
+    const r = await renderPhoto(lastRaw, lastBase);
+    shotBlob = r.blob;
+    shotCode = r.code;
+    openPreview(r.blob, r.code);
+    toast('已按新水印重新出图');
+  } catch (e) {
+    toast('重出图失败：' + (e && e.message ? e.message : e));
+  } finally {
+    hideBusy();
+    busy = false;
   }
 }
 
 /* ============================================================
    定位 / 地址 / 天气
    ============================================================ */
-async function jget(url, ms = 7000) {
+async function jget(url, ms) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms);
+  const timer = setTimeout(() => ctrl.abort(), ms || 7000);
   try {
     const r = await fetch(url, { signal: ctrl.signal, headers: { Accept: 'application/json' } });
     if (!r.ok) return null;
@@ -1106,15 +1112,15 @@ function weatherText(code) {
 async function geocodeAmap(lat, lng, key) {
   const g = wgs84ToGcj02(lat, lng);
   const url = 'https://restapi.amap.com/v3/geocode/regeo?key=' + encodeURIComponent(key) +
-    '&location=' + g[1].toFixed(6) + ',' + g[0].toFixed(6) +
-    '&extensions=all&radius=800&roadlevel=0';
+    '&location=' + g[1].toFixed(6) + ',' + g[0].toFixed(6) + '&extensions=all&radius=800&roadlevel=0';
   const j = await jget(url);
   if (!j || String(j.status) !== '1' || !j.regeocode) return '';
   const r = j.regeocode;
   let addr = r.formatted_address || '';
   if (!addr) {
     const ac = r.addressComponent || {};
-    addr = (ac.province || '') + (ac.city || '') + (ac.district || '') + (ac.township || '') + (ac.streetNumber && ac.streetNumber.street ? ac.streetNumber.street : '');
+    addr = (ac.province || '') + (ac.city || '') + (ac.district || '') + (ac.township || '') +
+      (ac.streetNumber && ac.streetNumber.street ? ac.streetNumber.street : '');
   }
   const poi = (r.pois && r.pois[0] && r.pois[0].name) || '';
   if (poi && addr && addr.indexOf(poi) < 0) addr += '（近' + poi + '）';
@@ -1141,8 +1147,7 @@ async function geocodeNominatim(lat, lng) {
 async function geocodeBdc(lat, lng) {
   const j = await jget(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lng}&localityLanguage=zh`);
   if (!j) return '';
-  const parts = [j.principalSubdivision, j.city, j.locality, j.localityInfo && j.localityInfo.adminLevel5]
-    .filter(Boolean);
+  const parts = [j.principalSubdivision, j.city, j.locality, j.localityInfo && j.localityInfo.adminLevel5].filter(Boolean);
   const uniq = [];
   for (const p of parts) if (uniq.indexOf(p) < 0) uniq.push(p);
   return uniq.join('');
@@ -1172,22 +1177,16 @@ let lastGeoKey = '';
 
 function updateStatus() {
   const el = $('#geoStatus');
+  if (!el) return;
   const manual = (S.place || '').trim();
-  if (manual) {
-    el.textContent = '手动地点 · ' + manual;
-    return;
-  }
-  if (geo.lat == null) {
-    el.textContent = '定位中…（可拍照，稍后自动补上地点）';
-    return;
-  }
+  if (manual) { el.textContent = '手动地点 · ' + manual; return; }
+  if (geo.lat == null) { el.textContent = '定位中…（可先拍，地点稍后补）'; return; }
   const pos = geo.lat.toFixed(5) + ', ' + geo.lng.toFixed(5);
-  el.textContent = geo.addr ? (geo.addr + ' · ' + pos) : ('未解析到地址 · ' + pos);
+  el.textContent = (geo.addr ? geo.addr : '未解析到地址') + (geo.acc ? ` · ±${Math.round(geo.acc)}m` : '');
 }
 
 async function resolvePlace() {
-  const lat = geo.lat;
-  const lng = geo.lng;
+  const lat = geo.lat, lng = geo.lng;
   if (lat == null) return;
   const [addr, wx] = await Promise.all([fetchAddress(lat, lng), fetchWeather(lat, lng)]);
   if (lat !== geo.lat) return;
@@ -1204,6 +1203,7 @@ function onPos(pos) {
   geo.lat = c.latitude;
   geo.lng = c.longitude;
   geo.acc = c.accuracy;
+  geo.alt = (c.altitude != null && isFinite(c.altitude)) ? c.altitude : geo.alt;
   const key = geo.lat.toFixed(3) + ',' + geo.lng.toFixed(3);
   updateStatus();
   renderOverlay();
@@ -1215,12 +1215,14 @@ function onPos(pos) {
 
 function onGeoError(err) {
   const map = { 1: '定位权限被拒绝', 2: '定位不可用', 3: '定位超时' };
-  $('#geoStatus').textContent = map[err.code] || '定位失败';
+  const el = $('#geoStatus');
+  if (el) el.textContent = map[err.code] || '定位失败';
 }
 
 function initGeo() {
   if (!navigator.geolocation) {
-    $('#geoStatus').textContent = '设备不支持定位';
+    const el = $('#geoStatus');
+    if (el) el.textContent = '设备不支持定位';
     return;
   }
   if (watchId != null) navigator.geolocation.clearWatch(watchId);
@@ -1232,7 +1234,7 @@ function initGeo() {
 }
 
 /* ============================================================
-   相册导入（读取 EXIF 时间与 GPS）
+   相册导入
    ============================================================ */
 function loadImage(url) {
   return new Promise((res, rej) => {
@@ -1253,16 +1255,14 @@ async function importFile(file) {
 
     const hasGps = !!(exif && exif.hasGps);
     const time = (exif && exif.date) || (file.lastModified ? new Date(file.lastModified) : new Date());
-
     let lat = hasGps ? exif.lat : geo.lat;
     let lng = hasGps ? exif.lng : geo.lng;
     let src = hasGps ? 'import-exif' : 'import-device';
     if (!hasGps && lat == null) src = 'import-none';
 
     let addr = '';
-    if ((S.place || '').trim()) {
-      addr = S.place.trim();
-    } else if (lat != null && lng != null) {
+    if ((S.place || '').trim()) addr = S.place.trim();
+    else if (lat != null && lng != null) {
       showBusy('正在解析原图坐标…');
       addr = await fetchAddress(lat, lng);
     }
@@ -1273,16 +1273,17 @@ async function importFile(file) {
     const H = img.naturalHeight || img.height;
 
     const canvas = document.createElement('canvas');
-    canvas.width = W;
-    canvas.height = H;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, 0, 0, W, H);
+    canvas.width = W; canvas.height = H;
+    canvas.getContext('2d').drawImage(img, 0, 0, W, H);
 
     showBusy('正在签名…');
-    const base = { time, lat, lng, addr, weather: '', src };
-    const r = await processPhoto(canvas, base);
+    const base = { time, lat, lng, addr, weather: geo.weather || '', src, acc: null, altitude: null };
+    lastRaw = canvas;
+    lastBase = base;
+    const r = await renderPhoto(canvas, base);
     shotBlob = r.blob;
     shotCode = r.code;
+    pushHistory(r.blob, r.code, base);
     openPreview(r.blob, r.code);
 
     const parts = [];
@@ -1301,25 +1302,13 @@ async function importFile(file) {
 /* ============================================================
    UI
    ============================================================ */
-function toast(msg) {
-  toastEl.textContent = msg;
-  toastEl.classList.add('show');
-  clearTimeout(toast._t);
-  toast._t = setTimeout(() => toastEl.classList.remove('show'), 3200);
-}
-
-/* ---------- 水印样式面板 ---------- */
 function snapshotFrame(w, h) {
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
   const ctx = c.getContext('2d');
   if (video.videoWidth) {
-    const vr = video.videoWidth / video.videoHeight;
-    const cr = w / h;
-    let sw = video.videoWidth, sh = video.videoHeight, sx = 0, sy = 0;
-    if (vr > cr) { sw = Math.round(video.videoHeight * cr); sx = Math.round((video.videoWidth - sw) / 2); }
-    else { sh = Math.round(video.videoWidth / cr); sy = Math.round((video.videoHeight - sh) / 2); }
-    try { ctx.drawImage(video, sx, sy, sw, sh, 0, 0, w, h); } catch (e) {}
+    const r = coverRect(video.videoWidth, video.videoHeight, w / h);
+    try { ctx.drawImage(video, r.x, r.y, r.w, r.h, 0, 0, w, h); } catch (e) {}
   } else {
     const g = ctx.createLinearGradient(0, 0, w, h);
     g.addColorStop(0, '#2b3648'); g.addColorStop(1, '#141a24');
@@ -1338,12 +1327,12 @@ function snapshotFrame(w, h) {
 function buildStyleGrid() {
   const grid = $('#styleGrid');
   if (!grid || grid.dataset.built) return;
-  grid.innerHTML = STYLE_META.map(m => (
-    '<div class="style-item" data-style="' + m.id + '" role="button" tabindex="0">' +
-      '<canvas width="340" height="340"></canvas>' +
-      '<div class="si-foot"><span>' + m.name + '</span><i class="si-check"></i></div>' +
-    '</div>'
-  )).join('');
+  grid.innerHTML = WM.STYLES.map(m =>
+    `<div class="style-item" data-style="${m.id}" role="button" tabindex="0">
+       <canvas width="340" height="340"></canvas>
+       <div class="si-foot"><span>${m.name}</span><i class="si-check"></i></div>
+     </div>`
+  ).join('');
   grid.dataset.built = '1';
   grid.addEventListener('click', e => {
     const b = e.target.closest('.style-item');
@@ -1356,22 +1345,20 @@ function buildStyleGrid() {
   });
 }
 
-/* 缩略图用显式像素尺寸，避免 flex/grid 内 aspect-ratio 撑不开高度 */
 function sizeStyleThumbs() {
   const grid = $('#styleGrid');
   if (!grid) return;
   const cs = getComputedStyle(grid);
   const inner = grid.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
   const w = Math.max(72, Math.floor((inner - 11) / 2));
-  const h = w;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
   grid.querySelectorAll('.style-item canvas').forEach(c => {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
     c.style.width = w + 'px';
-    c.style.height = h + 'px';
+    c.style.height = w + 'px';
     c.width = Math.round(w * dpr);
-    c.height = Math.round(h * dpr);
+    c.height = Math.round(w * dpr);
   });
-  return { w, h };
+  return { w, h: w };
 }
 
 function paintStyleThumbs() {
@@ -1379,13 +1366,19 @@ function paintStyleThumbs() {
   if (!grid) return;
   const sz = sizeStyleThumbs() || { w: 340, h: 340 };
   const base = snapshotFrame(sz.w, sz.h);
-  const d = buildData(liveBase(), uiCode);
+  const d = WM.buildData(liveBase(), S, uiCode);
+  let ink = 'dark';
+  if (S.autoInk) {
+    try { ink = WM.measureInk(base.getContext('2d'), sz.w, sz.h, S.pos === 'top' ? 'top' : 'bottom'); } catch (e) {}
+  }
   grid.querySelectorAll('.style-item').forEach(item => {
     const c = item.querySelector('canvas');
     const ctx = c.getContext('2d');
     ctx.clearRect(0, 0, c.width, c.height);
     ctx.drawImage(base, 0, 0);
-    drawWatermark(ctx, c.width, c.height, d, item.dataset.style);
+    WM.draw(ctx, c.width, c.height, d, {
+      style: item.dataset.style, pos: S.pos, scale: S.wmScale, ink, s: S
+    });
     item.classList.toggle('on', item.dataset.style === S.style);
   });
   base.width = base.height = 0;
@@ -1400,6 +1393,7 @@ function openStyleSheet() {
 function closeStyleSheet() {
   $('#styleSheet').classList.remove('show');
   $('#styleMask').classList.remove('show');
+  if ($('#preview').classList.contains('show')) reRender();
 }
 
 function syncUI() {
@@ -1407,19 +1401,62 @@ function syncUI() {
   $('#inpPlace').value = S.place || '';
   $('#inpAmap').value = S.amapKey || '';
   $('#inpPlace').placeholder = geo.addr ? ('自动：' + geo.addr) : '自动定位地址';
-  $('#swTime').checked = !!S.showTime;
-  $('#swSeconds').checked = !!S.showSeconds;
-  $('#swPlace').checked = !!S.showPlace;
-  $('#swCoords').checked = !!S.showCoords;
-  $('#swWeather').checked = !!S.showWeather;
-  $('#swCode').checked = !!S.showCode;
-  $('#swGcj').checked = !!S.coordGcj;
+  $('#inpFields').value = (S.fields || []).map(f => f.k ? `${f.k}：${f.v}` : f.v).join('\n');
+
+  const map = {
+    swTime: 'showTime', swSeconds: 'showSeconds', swPlace: 'showPlace',
+    swCoords: 'showCoords', swWeather: 'showWeather', swCode: 'showCode',
+    swGcj: 'coordGcj', swAlt: 'showAltitude', swAcc: 'showAccuracy',
+    swInk: 'autoInk', swExif: 'writeExif', swSmart: 'smartPick', swGrid: 'grid'
+  };
+  for (const id in map) {
+    const el = document.getElementById(id);
+    if (el) el.checked = !!S[map[id]];
+  }
+
   const nameEl = $('#styleName');
   if (nameEl) nameEl.textContent = styleName(S.style);
-  document.querySelectorAll('.style-item').forEach(it => {
-    it.classList.toggle('on', it.dataset.style === S.style);
-  });
+
+  setSeg('segPos', S.pos);
+  setSeg('segScale', String(S.wmScale));
+  setSeg('segQuality', S.quality);
+  setSeg('segCoord', S.coordFmt);
+  setSeg('segTimer', String(S.timer));
+
+  $$('.style-item').forEach(it => it.classList.toggle('on', it.dataset.style === S.style));
   updateStatus();
+  syncTools();
+  applyGrid();
+}
+
+function setSeg(id, val) {
+  const box = document.getElementById(id);
+  if (!box) return;
+  $$('button', box).forEach(b => b.classList.toggle('on', b.dataset.v === String(val)));
+}
+
+function syncTools() {
+  const t = document.getElementById('btnTorch');
+  if (t) t.classList.toggle('on', torchOn);
+  const g = document.getElementById('btnGrid');
+  if (g) g.classList.toggle('on', !!S.grid);
+  const l = document.getElementById('btnLevel');
+  if (l) l.classList.toggle('on', !!S.level);
+  const tm = document.getElementById('btnTimer');
+  if (tm) {
+    tm.classList.toggle('on', S.timer > 0);
+    const sp = tm.querySelector('span');
+    if (sp) sp.textContent = S.timer > 0 ? S.timer + 's' : '定时';
+  }
+  const ev = document.getElementById('evVal');
+  if (ev) ev.textContent = (S.ev > 0 ? '+' : '') + Number(S.ev).toFixed(1);
+  const sl = document.getElementById('evSlider');
+  if (sl && Number(sl.value) !== Number(S.ev)) sl.value = S.ev;
+}
+
+function applyGrid() {
+  const g = document.getElementById('gridLines');
+  if (g) g.classList.toggle('show', !!S.grid);
 }
 
 async function fillFingerprint() {
@@ -1444,21 +1481,55 @@ function closeSheet() {
   renderOverlay();
 }
 
+function openGallery() {
+  renderHistory();
+  $('#gallery').classList.add('show');
+  $('#galleryMask').classList.add('show');
+}
+function closeGallery() {
+  $('#gallery').classList.remove('show');
+  $('#galleryMask').classList.remove('show');
+}
+
+/* ---------- 水平仪 ---------- */
+function initLevel() {
+  const el = $('#levelBar');
+  if (!el) return;
+  const onOrient = e => {
+    let deg = 0;
+    if (e.gamma != null) deg = e.gamma;         // 左右倾斜
+    if (Math.abs(deg) > 90) deg = 0;
+    const clamped = Math.max(-45, Math.min(45, deg));
+    el.style.transform = `rotate(${-clamped}deg)`;
+    el.classList.toggle('ok', Math.abs(deg) < 1.5);
+    el.classList.toggle('show', !!S.level);
+  };
+  if (window.DeviceOrientationEvent) {
+    window.addEventListener('deviceorientation', onOrient, true);
+  }
+}
+
+/* ---------- 绑定 ---------- */
 function bindUI() {
   $('#btnSettings').addEventListener('click', openSheet);
   $('#btnDone').addEventListener('click', closeSheet);
   $('#sheetMask').addEventListener('click', closeSheet);
 
-  $('#inpTitle').addEventListener('input', e => {
-    S.title = e.target.value;
-    saveSettings();
-    renderOverlay();
-  });
-
+  $('#inpTitle').addEventListener('input', e => { S.title = e.target.value; saveSettings(); renderOverlay(); });
   $('#inpPlace').addEventListener('input', e => {
-    S.place = e.target.value;
+    S.place = e.target.value; saveSettings(); updateStatus(); renderOverlay();
+  });
+  $('#inpFields').addEventListener('input', e => {
+    S.fields = e.target.value.split('\n')
+      .map(line => line.trim())
+      .filter(Boolean)
+      .slice(0, 8)
+      .map(line => {
+        const i = line.indexOf('：') >= 0 ? line.indexOf('：') : line.indexOf(':');
+        if (i < 0) return { k: '', v: line };
+        return { k: line.slice(0, i).trim(), v: line.slice(i + 1).trim() };
+      });
     saveSettings();
-    updateStatus();
     renderOverlay();
   });
 
@@ -1467,7 +1538,7 @@ function bindUI() {
     saveSettings();
     lastGeoKey = '';
     initGeo();
-    toast(S.amapKey ? '已设置高德 Key，正在重新解析地址' : '已清除高德 Key');
+    toast(S.amapKey ? '已设置高德 Key，正在重新解析' : '已清除高德 Key');
   });
 
   $('#btnAutoPlace').addEventListener('click', () => {
@@ -1481,19 +1552,41 @@ function bindUI() {
   });
 
   const toggles = [
-    ['#swTime', 'showTime'],
-    ['#swSeconds', 'showSeconds'],
-    ['#swPlace', 'showPlace'],
-    ['#swCoords', 'showCoords'],
-    ['#swWeather', 'showWeather'],
-    ['#swCode', 'showCode'],
-    ['#swGcj', 'coordGcj']
+    ['#swTime', 'showTime'], ['#swSeconds', 'showSeconds'], ['#swPlace', 'showPlace'],
+    ['#swCoords', 'showCoords'], ['#swWeather', 'showWeather'], ['#swCode', 'showCode'],
+    ['#swGcj', 'coordGcj'], ['#swAlt', 'showAltitude'], ['#swAcc', 'showAccuracy'],
+    ['#swInk', 'autoInk'], ['#swExif', 'writeExif'], ['#swSmart', 'smartPick']
   ];
   toggles.forEach(([sel, key]) => {
-    $(sel).addEventListener('change', e => {
+    const el = $(sel);
+    if (!el) return;
+    el.addEventListener('change', e => {
       S[key] = e.target.checked;
       saveSettings();
       renderOverlay();
+      if (key === 'grid') applyGrid();
+    });
+  });
+
+  // 分段选择器
+  const segs = [
+    ['segPos', v => { S.pos = v; }],
+    ['segScale', v => { S.wmScale = Number(v); }],
+    ['segQuality', v => { S.quality = v; }],
+    ['segCoord', v => { S.coordFmt = v; }],
+    ['segTimer', v => { S.timer = Number(v); }]
+  ];
+  segs.forEach(([id, apply]) => {
+    const box = document.getElementById(id);
+    if (!box) return;
+    box.addEventListener('click', e => {
+      const b = e.target.closest('button');
+      if (!b) return;
+      apply(b.dataset.v);
+      saveSettings();
+      syncUI();
+      renderOverlay();
+      if (id === 'segQuality') startCamera(curDeviceId, { keepLenses: true });
     });
   });
 
@@ -1510,15 +1603,31 @@ function bindUI() {
     const b = e.target.closest('.lens');
     if (b) setLens(Number(b.dataset.i));
   });
-  $('#btnRelocate').addEventListener('click', () => {
-    lastGeoKey = '';
-    geo.addr = '';
-    geo.weather = '';
+
+  const btnRelocate = $('#btnRelocate');
+  if (btnRelocate) btnRelocate.addEventListener('click', () => {
+    lastGeoKey = ''; geo.addr = ''; geo.weather = '';
     toast('正在重新定位…');
     initGeo();
     renderOverlay();
   });
-  $('#btnGallery').addEventListener('click', () => $('#fileInput').click());
+
+  $('#btnGallery').addEventListener('click', openGallery);
+  $('#btnGalleryClose').addEventListener('click', closeGallery);
+  $('#galleryMask').addEventListener('click', closeGallery);
+  $('#btnPickFile').addEventListener('click', () => $('#fileInput').click());
+  $('#btnSaveAll').addEventListener('click', saveAll);
+
+  $('#historyGrid').addEventListener('click', e => {
+    const b = e.target.closest('.shot');
+    if (!b) return;
+    const h = history[Number(b.dataset.i)];
+    if (!h) return;
+    shotBlob = h.blob;
+    shotCode = h.code;
+    openPreview(h.blob, h.code);
+    closeGallery();
+  });
 
   $('#fileInput').addEventListener('change', e => {
     const file = e.target.files && e.target.files[0];
@@ -1526,31 +1635,44 @@ function bindUI() {
     if (file) importFile(file);
   });
 
-  $('#btnEnableCam').addEventListener('click', startCamera);
+  $('#btnEnableCam').addEventListener('click', () => startCamera());
   $('#btnSave').addEventListener('click', saveShot);
   $('#btnShare').addEventListener('click', shareShot);
-
-  const closePreview = () => {
-    $('#preview').classList.remove('show');
-    if (!stream) startCamera();
-  };
   $('#btnClosePreview').addEventListener('click', closePreview);
   $('#btnRetake').addEventListener('click', closePreview);
+  $('#btnEditWm').addEventListener('click', () => {
+    closePreview();
+    openStyleSheet();
+  });
+
+  // 工具条
+  $('#btnTorch').addEventListener('click', toggleTorch);
+  $('#btnGrid').addEventListener('click', () => { S.grid = !S.grid; saveSettings(); syncTools(); applyGrid(); });
+  $('#btnLevel').addEventListener('click', () => { S.level = !S.level; saveSettings(); syncTools(); });
+  $('#btnTimer').addEventListener('click', () => {
+    S.timer = S.timer === 0 ? 3 : (S.timer === 3 ? 10 : 0);
+    saveSettings(); syncTools(); renderOverlay();
+    toast(S.timer ? `定时 ${S.timer} 秒` : '定时已关闭');
+  });
+
+  const evSlider = $('#evSlider');
+  if (evSlider) {
+    evSlider.addEventListener('input', e => {
+      S.ev = Number(e.target.value);
+      saveSettings();
+      syncTools();
+      applyEv(S.ev);
+    });
+  }
 
   $('#btnCopyFp').addEventListener('click', async () => {
     const fp = $('#fpText').dataset.fp || '';
     if (!fp) return;
-    try {
-      await navigator.clipboard.writeText(fp);
-      toast('公钥指纹已复制');
-    } catch (e) {
-      toast('复制失败，请长按指纹文字');
-    }
+    try { await navigator.clipboard.writeText(fp); toast('公钥指纹已复制'); }
+    catch (e) { toast('复制失败，请长按文字'); }
   });
 
-  if (navigator.share && navigator.canShare) {
-    $('#btnShare').hidden = false;
-  }
+  if (navigator.share && navigator.canShare) $('#btnShare').hidden = false;
 
   window.addEventListener('resize', layoutStage);
   window.addEventListener('resize', () => {
@@ -1571,24 +1693,22 @@ function hideSplash() {
   const run = () => {
     if (done) return;
     done = true;
-    const wait = Math.max(0, 560 - (performance.now() - t0));
+    const wait = Math.max(0, 620 - (performance.now() - t0));
     setTimeout(() => {
       el.classList.add('hide');
       setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 620);
     }, wait);
   };
-  if (video && video.readyState >= 2) {
-    run();
-    return;
-  }
+  if (video && video.readyState >= 2) { run(); return; }
   const onReady = () => { video.removeEventListener('loadeddata', onReady); run(); };
   if (video) video.addEventListener('loadeddata', onReady);
-  setTimeout(run, 2200);
+  setTimeout(run, 2400);
 }
 
 function boot() {
   bindUI();
   syncUI();
+  initLevel();
   initGeo();
   startCamera();
   setInterval(renderOverlay, 500);
@@ -1602,6 +1722,9 @@ function boot() {
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
 }
+
+video.addEventListener('loadedmetadata', layoutStage);
+video.addEventListener('resize', layoutStage);
 
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', boot);
