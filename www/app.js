@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.5.3';
+const APP_VERSION = '1.5.4';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -363,22 +363,20 @@ function targetFps() {
    ② 绝不给 aspectRatio。理由同上：它会让浏览器用裁切来凑比例。
 
    帧率按屏幕刷新率给，用户那块 120Hz 屏不该只跑 30。 */
-/* 横屏时如果摄像头仍给竖版的流（部分机型不跟 display rotation 走），
-   取景框是宽的、流是高的，cover 会把画面横向放大成中间一条竖带 ——
-   看起来就是「视角根本没切换」。这时候把请求的宽高对调再要一次。
-   只做一次（用 key 记住这个方向已经试过），避免来回重启摄像头。 */
-let streamFlip = false;
-let aspectFixKey = '';
 let streamFixTimer = 0;
 
 function streamConstraint() {
-  // 预览流固定要横版 4:3，不跟方向换成竖版。
+  // 预览流固定要横版 4:3，**任何时候都不跟方向换**。
   // 原因：WebView 遇到「竖版请求」时会自己从传感器画面中心裁一块出来，
   // 等效 1.8~2.4 倍数码变焦 —— 之前「视角比原生相机近一大截」就是这么来的。
   // 竖拍要的竖版流只在按快门那一刻临时协商（见 grabHiRes），预览不受影响。
-  let h = Number(S.size) || 1080;
-  let w = Math.round(h * 4 / 3);
-  if (streamFlip) { const t = w; w = h; h = t; }
+  //
+  // 以前还有个 streamFlip：横屏发现流是竖的就把宽高对调、**重开一次摄像头**。
+  // 那正是用户反复报的「横屏切换闪屏 / 低端机卡一下」的根源 —— 重开流要
+  // 停轨、协商、等首帧，中间必然黑一下。现在改成纯 CSS 转 90°（见
+  // videoRotDeg），不碰摄像头，零重开。
+  const h = Number(S.size) || 1080;
+  const w = Math.round(h * 4 / 3);
   return {
     width: { ideal: w },
     height: { ideal: h },
@@ -451,7 +449,10 @@ async function startCamera(deviceId, opts) {
     const st = (track.getSettings && track.getSettings()) || {};
     devDiag.stream = (st.width || 0) + 'x' + (st.height || 0) +
       (st.focalLengthX ? ' ' + Math.round(st.focalLengthX) + 'mm' : '');
-    curDeviceId = st.deviceId || deviceId || null;
+    // 调用方明确指定了设备（多摄切镜头）就以它为准：部分 ROM 的
+    // getSettings().deviceId 和 enumerateDevices() 给的不是同一个串，
+    // 用 settings 反推会让镜头条「点了不亮」。
+    curDeviceId = deviceId || st.deviceId || null;
     if (st.facingMode) facing = st.facingMode;
     caps = (track.getCapabilities && track.getCapabilities()) || {};
 
@@ -505,8 +506,18 @@ function videoRotDeg() {
     return (n === 90 || n === 270) ? n : 0;
   }
   // 自动 = 信任 WebView 的 display rotation（Android 上它会把 sensor 帧转到
-  // 屏幕方向再交给 <video>），这里不再二次旋转。
-  // 少数机型不做旋转，画面会躺 90°，用设置里的「画面方向」手动扳正即可。
+  // 屏幕方向再交给 <video>），绝大多数机型这里什么都不用做。
+  //
+  // 唯一例外：横屏时拿到的流仍然是竖的（videoHeight > videoWidth），说明这台
+  // WebView 没跟显示方向走 —— 画面在宽取景框里会被 cover 拉成中间一条竖带，
+  // 看起来就是「视角根本没切换」。以前遇到这种情况会对调宽高**重开摄像头**，
+  // 那是横屏闪屏 + 低端机卡顿的根源；现在直接给画面转 90°（纯 GPU 合成，
+  // 不碰流、不重新协商、不掉帧）。
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (vw && vh && vh > vw) {
+    const W = stage.clientWidth, H = stage.clientHeight;
+    if (W > H) return orient.q === 90 ? 90 : 270;
+  }
   return 0;
 }
 
@@ -532,7 +543,9 @@ function applyVideoTransform() {
   if (facing === 'user') parts.push('scaleX(-1)');
   if (zoom.type === 'crop' && zoom.v > 1) parts.push('scale(' + zoom.v + ')');
   video.style.transformOrigin = '50% 50%';
-  video.style.transform = parts.join(' ') || 'none';
+  // 即使什么都不用转也带上 translateZ(0)：给 video 单独一层合成层，
+  // 横竖切换改尺寸时不会牵动整棵树，也不会闪一帧黑。
+  video.style.transform = parts.length ? parts.join(' ') : 'translateZ(0)';
 }
 
 /* ---------- 镜头扫描（沿用 v1.2 的逻辑） ---------- */
@@ -549,16 +562,77 @@ function focalToLabel(ratio) {
   return (best % 1 === 0 ? best : best.toFixed(1)) + '×';
 }
 
-/* 变焦：只走传感器的 zoom 能力。
-   ------------------------------------------------------------
-   旧实现有两处问题，都被反馈过：
-   1) 「多摄探测」会对每个后置摄像头各开一次流、读能力、再关掉，
-      4 摄机型要开合 4 次，每次几百毫秒，画面还会闪 —— 这是卡顿的主因之一。
-   2) 拿不到 zoom 能力时用「裁切」冒充变焦。裁切只是把中心区域放大，
-      分辨率本来就低（4.9MP 的视频流），再裁就是雪上加霜，越拉越糊。
-      用户要的是「调用机器本身摄像头」，不是数字变焦。
+/* ---------- 多摄：把机器上真实的几颗后置镜头都列出来 ----------
+   WebView 的 enumerateDevices() 在拿到相机权限后会列出全部 videoinput，
+   三摄 / 四摄机型就是三四条。以前那套「多摄探测」是逐个 getUserMedia 开流
+   读焦距再关掉 —— 4 摄要开合 4 次、每次几百毫秒、画面狂闪，早被否掉了。
+   现在只读设备列表（一次 IPC、几毫秒、不开流），切哪颗由用户点，点下去才
+   真正换一路流。焦距在切过去之后从 track.getSettings() 读回来并缓存，
+   下次就直接显示成「0.5× / 1× / 3×」而不是「镜头1/2/3」。 */
+const LENS_FOCAL_KEY = 'wmc.lensFocal';
+const LENS_BASE_KEY = 'wmc.lensBase';
+let lensFocal = {};     // deviceId -> 物理焦距(mm)
+let lensBase = 0;       // 主摄焦距，倍率的基准
 
-   所以这里只保留真实 zoom；设备不给能力就不显示变焦入口。 */
+function loadLensFocal() {
+  try {
+    const o = JSON.parse(localStorage.getItem(LENS_FOCAL_KEY) || '{}');
+    lensFocal = (o && typeof o === 'object') ? o : {};
+  } catch (e) { lensFocal = {}; }
+  lensBase = Number(localStorage.getItem(LENS_BASE_KEY)) || 0;
+}
+function saveLensFocal() {
+  try {
+    localStorage.setItem(LENS_FOCAL_KEY, JSON.stringify(lensFocal));
+    if (lensBase) localStorage.setItem(LENS_BASE_KEY, String(lensBase));
+  } catch (e) {}
+}
+
+/* 记下当前这路的焦距。第一次成功打开后置摄像头时，它就是主摄 ——
+   默认 facingMode=environment 拿到的就是厂商设定的主摄，不用猜 camera2 序号。 */
+function learnLens(track, devId) {
+  if (!track || !devId) return;
+  const st = (track.getSettings && track.getSettings()) || {};
+  const f = Number(st.focalLengthX || st.focalLength) || 0;
+  if (!f) return;
+  if (lensFocal[devId] !== f) {
+    lensFocal[devId] = f;
+    if (!lensBase && facing === 'environment') lensBase = f;
+    saveLensFocal();
+  }
+}
+
+/* 倍率标签：焦距 / 主摄焦距，吸附到相机常见的标准档。
+   还没学到焦距的镜头先显示「镜头N」，点一次之后就变成倍率了。 */
+function lensLabel(id, fallback) {
+  const f = lensFocal[id];
+  if (!f || !lensBase) return fallback;
+  return focalToLabel(f / lensBase);
+}
+
+/* 只读一次设备列表，不开流。不按 camera2 序号假设谁是主摄，但按它排序 ——
+   顺序稳定了，用户下次还能在同一个位置找到同一颗镜头。 */
+async function scanDeviceLenses() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
+  let all = [];
+  try { all = await navigator.mediaDevices.enumerateDevices(); } catch (e) { return []; }
+  const cams = all.filter(d => d.kind === 'videoinput' && d.deviceId);
+  // 前置不列在这里（顶栏有单独的前后摄切换）；label 为空时无从判断，按后置算
+  const want = facing === 'user' ? 'user' : 'environment';
+  const mine = cams.filter(d => (facingOfDevice(d) || 'environment') === want);
+  if (mine.length < 2) return [];
+  const idx = d => { const m = /camera2?\s*(\d+)/i.exec(d.label || ''); return m ? +m[1] : 99; };
+  mine.sort((a, b) => idx(a) - idx(b));
+  return mine.map((d, i) => ({ id: d.deviceId, name: '镜头' + (i + 1) }));
+}
+
+/* 变焦 / 镜头条。
+   ------------------------------------------------------------
+   优先级：
+     ① 机器上有多颗真实镜头（三摄/四摄）→ 列物理镜头，点了真换一路流，
+        画质是光学级别的，这才是「把多摄利用上」；
+     ② 只有一路逻辑相机、但它支持硬件变焦 → 列 1×/2×/3×/5×。
+   没有真实能力就什么都不显示：绝不用「裁切放大」冒充变焦（越拉越糊）。 */
 async function setupZoom(track) {
   lensList = [];
   lensMode = 'none';
@@ -568,6 +642,8 @@ async function setupZoom(track) {
   renderLensBar();
   if (!track) return;
 
+  learnLens(track, curDeviceId);
+
   const c = (track.getCapabilities && track.getCapabilities()) || {};
   const cz = c.zoom;
   const lo = (cz && cz.min) || 1;
@@ -576,6 +652,22 @@ async function setupZoom(track) {
   if (cz && track.applyConstraints) {
     try { await track.applyConstraints({ advanced: [{ zoom: lo }] }); } catch (e) {}
   }
+
+  // ① 物理镜头
+  const devs = await scanDeviceLenses();
+  if (devs.length >= 2) {
+    lensMode = 'device';
+    lensList = devs.map(d => ({
+      key: 'd' + d.id,
+      label: lensLabel(d.id, d.name),
+      deviceId: d.id
+    }));
+    lensIndex = Math.max(0, lensList.findIndex(l => l.deviceId === curDeviceId));
+    renderLensBar();
+    return;
+  }
+
+  // ② 硬件变焦
   if (!cz || !(cz.max > lo)) return;         // 没有硬件变焦能力，直接不给入口
 
   const max = Math.min(cz.max, 8);
@@ -611,6 +703,10 @@ function renderLensBar() {
 async function setLens(i) {
   if (!lensList[i] || i === lensIndex) return;
   const l = lensList[i];
+
+  // 物理镜头：真正换一路流（光学级别，比数字变焦清晰得多）
+  if (l.deviceId) { await switchLensDevice(i); return; }
+
   const prev = lensIndex;
   const prevZoom = zoom;
 
@@ -634,6 +730,26 @@ async function setLens(i) {
     renderLensBar();
     toast('这台设备的相机不支持该倍率');
   }
+}
+
+/* 切到另一颗物理镜头。
+   这会真的重开一路流（停轨 → getUserMedia → 等首帧），200~500ms，
+   但只在用户主动点镜头时才发生 —— 横竖旋转永远不会走这里。
+   切换前 startCamera 会先 grabPoster 把当前帧贴成占位图，所以不会露出
+   WebView 那张带播放箭头的灰底默认图。 */
+async function switchLensDevice(i) {
+  const l = lensList[i];
+  const prevIdx = lensIndex;
+  const prevId = curDeviceId;
+  lensIndex = i;
+  renderLensBar();
+  const ok = await startCamera(l.deviceId, { keepLenses: true });
+  if (ok) return;
+  // 这颗镜头打不开（被别的应用占用 / deviceId 已轮换）：退回原来那颗
+  lensIndex = prevIdx;
+  renderLensBar();
+  toast('这颗镜头打不开，已切回原镜头');
+  if (prevId) await startCamera(prevId, { keepLenses: true });
 }
 
 /* ---------- 双指缩放 ---------- */
@@ -875,6 +991,30 @@ function toQuarter(deg) {
   return 0;
 }
 
+/* 布局调度器：一帧内多次触发（resize 连发、陀螺仪和 orientationchange
+   几乎同时到）只排一次。
+   低端机上 layoutStage 每次都要读 getComputedStyle / offsetHeight，连续触发
+   就是连续强制同步布局 —— 这是横竖切换「异常卡顿」的主要来源之一。 */
+let layoutRaf = 0;
+let layoutAnimWanted = false;
+function scheduleLayout(anim) {
+  if (anim) layoutAnimWanted = true;
+  if (layoutRaf) return;
+  layoutRaf = requestAnimationFrame(() => {
+    layoutRaf = 0;
+    if (layoutAnimWanted) document.body.classList.add('layout-anim');
+    layoutAnimWanted = false;
+    layoutStage();
+    // 缩略图只在样式面板开着时才需要重绘：它要把整帧快照下来再画 N 张
+    // canvas，在低端机上是一次几十毫秒的活。以前每次旋转都无条件跑一遍，
+    // 面板根本没开，白烧 CPU —— 这也是切换发卡的一环。
+    const ss = $('#styleSheet');
+    if (ss && ss.classList.contains('show')) paintStyleThumbs();
+    clearTimeout(animTimer);
+    animTimer = setTimeout(() => document.body.classList.remove('layout-anim'), 420);
+  });
+}
+
 function applyOrientation(opts) {
   const gyro = !!(opts && opts.gyro);
   const want_land = targetLand();
@@ -889,18 +1029,23 @@ function applyOrientation(opts) {
   }
 
   // 陀螺仪先报「横了」，窗口可能下一帧才转。这时候立刻自己转 90° 就会
-  // 出现「先闪一下转过去、再被系统转回来」的双重旋转，看起来又卡又乱。
-  // 先等 380ms：系统转了 resize 会来，自己就不用转了。
+  // 出现「先闪一下转过去、再被系统转回来」的双重旋转，看起来又闪又卡。
+  // 壳是 SCREEN_ORIENTATION_SENSOR，系统一定会自己转窗口，所以这里把等待
+  // 拉长到 900ms：只要系统在 0.9 秒内转了（正常机型 100~300ms），resize 一来
+  // 就把定时器清掉，CSS 自转这条路根本不会走到 —— 界面上一次旋转都看不到。
+  // 900ms 还没转，才说明这台 ROM 确实不给转窗口，再用 CSS 兜底。
   if (gyro && want !== selfRot) {
     clearTimeout(rotTimer);
-    rotTimer = setTimeout(() => { rotTimer = 0; applyOrientation(); }, 380);
+    rotTimer = setTimeout(() => { rotTimer = 0; applyOrientation(); }, 900);
     return;
   }
   clearTimeout(rotTimer);
   rotTimer = 0;
 
+  const prevKey = selfRot + '|' + logicalLand + '|' + (S.full ? 1 : 0);
   selfRot = want;
   logicalLand = want ? want_land : winLand();
+  const nextKey = selfRot + '|' + logicalLand + '|' + (S.full ? 1 : 0);
 
   const body = document.body;
   body.classList.toggle('q90', want === 90);
@@ -926,36 +1071,26 @@ function applyOrientation(opts) {
     }
   }
 
-  // 旋转会改变可用宽高，等一帧再排。排之前先挂上 .layout-anim，
-  // 让取景框尺寸 / 控件位移走 260ms 缓动 —— 直接跳变看着太生硬。
-  requestAnimationFrame(() => {
-    document.body.classList.add('layout-anim');
-    layoutStage();
-    renderOverlay();
-    paintStyleThumbs();
-    clearTimeout(animTimer);
-    animTimer = setTimeout(() => document.body.classList.remove('layout-anim'), 460);
-  });
+  // 旋转会改变可用宽高，等一帧再排。只有横竖状态**真的变了**才挂
+  // .layout-anim：软键盘、地址栏之类的 resize 每次都带动画反而更卡。
+  scheduleLayout(prevKey !== nextKey || !!(opts && opts.anim));
 
-  // 横屏后如果摄像头给的还是竖版的流（cover 会横向放大成一条竖带，
-  // 看起来就是「视角没切换」），补一次校正。延迟一点，等首帧到。
+  // 横屏后如果摄像头给的还是竖版的流，补一次画面校正。
+  // 这里只是重新算 CSS transform，不重开流 —— 以前这里延迟 420ms 调
+  // startCamera，正好卡在画面刚稳定的时候，用户看到的就是「转完闪一下」。
   clearTimeout(streamFixTimer);
-  streamFixTimer = setTimeout(checkStreamOrient, 420);
+  streamFixTimer = setTimeout(checkStreamOrient, 120);
 }
 
-/* 横屏后校验一眼：摄像头给的流有没有跟着转过来。
-   横取景框 + 竖流的组合在 cover 下会被放大成中间一条竖带，也就是用户说的
-   「切到横屏了但视角没切换」。发现这种情况就把请求宽高对调重启一次。 */
+/* 横屏后校验一眼：画面要是不跟着转（流仍是竖的），交给 videoRotDeg 的
+   CSS 旋转兜底 —— 这里只重排一次，**绝不再重开摄像头**。
+   重开流是 1.5.2 及以前横屏「闪一下 + 低端机卡一秒」的全部原因：
+   stopStream → getUserMedia → 等 loadeddata 才能撤占位图。 */
 function checkStreamOrient() {
   if (!video.videoWidth || !video.videoHeight) return;
   if (camStarting || resuming || busy) return;
   if (!(video.videoHeight > video.videoWidth && winLand())) return;
-  const key = (winLand() ? 'L' : 'P') + (selfRot ? 's' : 'n');
-  if (aspectFixKey === key) return;
-  aspectFixKey = key;
-  streamFlip = !streamFlip;
-  if (!video.srcObject) return;
-  startCamera(curDeviceId, { keepLenses: true });
+  applyVideoTransform();
 }
 
 /* 重力单位向量（W3C DeviceOrientation 规范）。
@@ -1074,10 +1209,11 @@ function setOrientAuto(on) {
    全屏：顶栏、工具条、快门全部变成浮层压在画面上，取景吃满整屏，
    竖屏横屏都成立。 */
 function setFull(on) {
+  const changed = !!on !== !!S.full;
   S.full = !!on;
   saveSettings();
   document.body.classList.toggle('full', S.full);
-  applyOrientation();
+  applyOrientation({ anim: changed });
   syncTools();
   // 横屏没有单独的退出按钮，右上角那个四角图标自己就能关
   toast(S.full ? '全屏取景（点右上角的四角图标退出）' : '已退出全屏');
@@ -1881,7 +2017,12 @@ function rotateSource(src, deg) {
  * 预览里看到什么（含画面方向、前置镜像、变焦裁切、比例裁切），成片就是什么
  */
 function composeCanvas(raw) {
-  const rot = videoRotDeg();
+  // 预览的「自动转 90°」只在流本身是竖的（WebView 没跟显示方向）时才生效。
+  // 成片那张源图可能已经是横的（grabHiRes 重新协商过），这时候再转就把
+  // 照片转倒了 —— 所以先在源图上判断，只有它也是竖的才跟预览一起转。
+  const manual = !!(S.videoRot && S.videoRot !== 'auto');
+  const srcLand = raw.w && raw.h && raw.w > raw.h;
+  const rot = (!manual && srcLand) ? 0 : videoRotDeg();
   if (rot) {
     const r = rotateSource(raw.src, rot);
     raw = Object.assign({}, raw, { src: r.src, w: r.w, h: r.h });
@@ -2973,11 +3114,10 @@ function bindUI() {
 
   if (navigator.share && navigator.canShare) $('#btnShare').hidden = false;
 
-  window.addEventListener('resize', layoutStage);
-  window.addEventListener('resize', () => {
-    if ($('#styleSheet').classList.contains('show')) paintStyleThumbs();
-  });
-  window.addEventListener('orientationchange', () => setTimeout(layoutStage, 320));
+  // 尺寸变化统一走 applyOrientation → scheduleLayout 合并调度。
+  // 以前这里还各自绑了一份 layoutStage 和 paintStyleThumbs：同一次旋转要
+  // 排三遍布局、把缩略图重绘两遍，低端机上直接拖成幻灯片。
+  // resize / orientationchange 的主监听在 initOrientation 里，够用了。
   document.addEventListener('gesturestart', e => e.preventDefault());
 }
 
@@ -3009,6 +3149,8 @@ function boot() {
   syncUI();
   initLevel();
   initOrientation();
+  // 多摄：读回上次学到的焦距（哪颗是 0.5×、哪颗是主摄）
+  loadLensFocal();
   document.body.classList.toggle('full', !!S.full);
   applyOrientation();
   initGeo();

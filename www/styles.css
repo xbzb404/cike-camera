@@ -93,6 +93,9 @@ body.orient-lock #btnOrient{color:var(--accent);border-color:rgba(255,210,74,.45
   flex:0 1 auto;
   border-radius:18px;
   overflow:hidden;
+  /* 取景框内部（视频、水印 canvas、网格）怎么变都不外溢：横竖切换只重排
+     这一块，不用把整棵树重新算一遍。低端机上这一条能省下可观的布局时间。 */
+  contain:layout paint;
   /* 与 #app 同色：视野选「完整」时画面上下会留边，
      这里若用纯黑，那两条边就像硬贴上去的黑框 */
   background:#0a0e17;
@@ -108,6 +111,10 @@ body.orient-lock #btnOrient{color:var(--accent);border-color:rgba(255,210,74,.45
   object-fit:cover;
   background:#0a0e17;
   display:block;
+  /* 单独一层：横竖切换改的是这一层的尺寸/transform，不该牵动整棵布局树。
+     部分 WebView 在 <video> 改尺寸时会闪一帧黑，提前分层能把这一帧吃掉。 */
+  transform:translateZ(0);
+  backface-visibility:hidden;
 }
 /* 视野选「完整」时不裁切，保留全部场景，代价是可能留黑边 */
 .stage.view-wide video{object-fit:contain}
@@ -1117,24 +1124,16 @@ body.land #btnRelocate{
 }
 
 /* ---------- 横竖切换 / 进出全屏的过渡 ----------
-   尺寸硬跳变看着就是「卡一下」，这里给取景框和浮层加 260ms 缓动。
-   .layout-anim 只在切换那一刻挂 460ms：平时拖窗口 / 软键盘弹出不该有动画，
-   否则每一帧都跟着缓动，反而更卡。 */
-body.layout-anim .stage{
-  transition:
-    width .26s cubic-bezier(.22,.68,.28,1),
-    height .26s cubic-bezier(.22,.68,.28,1),
-    border-radius .24s ease;
-}
-body.layout-anim .stage-wrap,
+   取景框尺寸**不做过渡**。width/height 的 transition 会在这 260ms 里每一帧
+   触发布局 + 视频重采样，低端机上直接掉到个位数帧率 —— 用户报的「横屏
+   切换异常卡顿」主要就是它。尺寸直接跳到目标值，观感反而更跟手。
+   控件仍然保留 transform/opacity 的轻量过渡：这两样走合成层，不触发布局。 */
 body.layout-anim .controls,
 body.layout-anim .bars,
 body.layout-anim .topbar{
-  transition:opacity .22s ease, transform .26s cubic-bezier(.22,.68,.28,1);
+  transition:opacity .18s ease, transform .24s cubic-bezier(.22,.68,.28,1);
 }
 @media (prefers-reduced-motion:reduce){
-  body.layout-anim .stage,
-  body.layout-anim .stage-wrap,
   body.layout-anim .controls,
   body.layout-anim .bars,
   body.layout-anim .topbar{transition:none}

@@ -37,8 +37,8 @@ WWW = ROOT / "www"
 BUILD = ROOT / "build"
 
 APP_NAME = "此刻相机"
-DEFAULT_CODE = 21
-DEFAULT_NAME = "1.5.3"
+DEFAULT_CODE = 22
+DEFAULT_NAME = "1.5.4"
 
 # 本地签名材料（都已 gitignore）
 KEYSTORE = BUILD / "wmc.keystore"
