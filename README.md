@@ -36,6 +36,7 @@ Android APK 与网页版同源，全部逻辑在 `www/` 目录里，无框架、
 - 陀螺仪自动横竖屏，右上角一键锁定当前方向
 - 水印四角任意摆放（左下/右下/左上/右上），横屏自动挪到右上
 - 预览尺寸 720P / 1080P / 1440P 可切换，成片另走高分辨率采集
+- 成片分辨率可选：自动 / 12MP / 8MP / 5MP / 2MP；只缩不放，设备给不到时「相机信息」会标出目标值
 - 切后台自动关流、回前台自动恢复，死帧（全黑）会拦下重拍
 - 取景框固定 3:4（横屏铺满），画面 `object-fit:cover` 填满，不再出现一条矮横带
 - 自动影调分两段：先按中位亮度做**线性曝光归位**（过曝才压，最多 -2 档），再走黑场/白场曲线；高光软膝渐近 0.985，永不触顶
@@ -113,6 +114,7 @@ node tests/test-layout.js      # 8 样式 × 3 尺寸 × 3 位置 × 3 字号 = 
 node tests/test-tone.js        # 曝光/影调：溢出统计、百分位、档位建议、高光保护（26 项）
 node tests/test-imgproc.js     # 对焦评分、多帧择优、渐进降采样（15 项）
 PW_PATH=<playwright-core 路径> node tests/e2e-capture.js   # 假摄像头真实拍摄 + 生命周期 + 横竖屏 + 验真页（25 项）
+PW_PATH=<playwright-core 路径> node tests/test-still.js      # 成片分辨率三档（自动 / 12MP / 2MP）
 ```
 
 `e2e-capture.js` 用 Chromium 的 `--use-fake-device-for-media-stream` 走完整链路：按快门 → 取图 → 水印 → EXIF → 签名 → 预览，然后把成片取出来，在 Node 里独立解析 EXIF、校验哈希、验签，并把图片喂给验真页确认判定结果。

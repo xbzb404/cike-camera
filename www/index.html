@@ -231,14 +231,17 @@
       </div>
     </div>
     <div class="field">
-      <span class="field-label">成片尺寸（原生满幅分辨率最高，跟随预览最省时）</span>
-      <div class="seg" id="segQuality">
-        <button data-v="high">原生满幅</button>
-        <button data-v="standard">跟随预览</button>
+      <span class="field-label">成片分辨率（自动＝设备能给到的最高；只缩不放，实际值见「相机信息」）</span>
+      <div class="seg" id="segStill">
+        <button data-v="auto">自动</button>
+        <button data-v="12">12MP</button>
+        <button data-v="8">8MP</button>
+        <button data-v="5">5MP</button>
+        <button data-v="2">2MP</button>
       </div>
     </div>
     <div class="switch-list">
-      <label class="switch-item"><span>智能择优（连取 3 帧选最清晰）</span><input type="checkbox" id="swSmart"><i></i></label>
+      <label class="switch-item"><span>智能择优（连拍取最清晰一帧，稍慢但更稳）</span><input type="checkbox" id="swSmart"><i></i></label>
       <label class="switch-item"><span>写入标准 EXIF（时间/坐标/机型）</span><input type="checkbox" id="swExif"><i></i></label>
     </div>
 

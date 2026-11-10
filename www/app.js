@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.4.5';
+const APP_VERSION = '1.4.6';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -51,7 +51,7 @@ const DEFAULTS = {
   showCode: true,
   coordFmt: 'zh',       // zh | dec
   coordGcj: false,
-  quality: 'high',      // high | standard
+  still: 'auto',        // 成片分辨率：auto | 12 | 8 | 5 | 2（单位 MP，4:3）
   smartPick: true,
   writeExif: true,
   jpegQuality: 0.94,
@@ -102,7 +102,26 @@ function readSettings() {
   // 曝光补偿属于「当下场景的临时判断」，不该跨会话记忆。
   s.ev = 0;
   if (!['auto', '0', '90', '270'].includes(String(s.videoRot))) s.videoRot = 'auto';
+  // 成片分辨率：旧版只有 high/standard 两档，等价迁到 auto / 2MP，
+  // 迁完即锁定，之后用户自己选什么就是什么。
+  if (!s.stillMigrated) {
+    s.still = s.quality === 'standard' ? '2' : 'auto';
+    s.stillMigrated = true;
+  }
+  if (!['auto', '12', '8', '5', '2'].includes(String(s.still))) s.still = 'auto';
   return s;
+}
+
+/* 成片分辨率档位 → 目标像素尺寸。
+   统一按 4:3 折算：面积 = 12k²（4k × 3k），所以 k = √(MP / 12)。
+   auto 返回 null，表示「设备能给多大就给多大」。 */
+const STILL_MP = { '12': 12, '8': 8, '5': 5, '2': 2 };
+
+function stillTarget() {
+  const mp = STILL_MP[String(S.still)];
+  if (!mp) return null;
+  const k = Math.sqrt(mp * 1e6 / 12);
+  return { w: Math.round(4 * k), h: Math.round(3 * k), mp };
 }
 
 let S = readSettings();
@@ -1102,9 +1121,16 @@ function sharpenCanvas(canvas, raw) {
 
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const px = canvas.width * canvas.height;
+    // 超过 8.4MP 直接跳过：12MP 逐像素跑一遍 JS 要 600ms 以上，
+    // 用户按完快门干等，体感是「卡住」而不是「在处理」。如实标出来。
+    if (px > 8.4e6) {
+      devDiag.sharp = '跳过（' + (px / 1e6).toFixed(1) + 'MP 太大）';
+      return canvas;
+    }
     WMImg.unsharp(img, canvas.width, canvas.height, amount, 8.4e6);
     ctx.putImageData(img, 0, 0);
-    devDiag.sharp = { amount: +amount.toFixed(2), px: canvas.width * canvas.height };
+    devDiag.sharp = { amount: +amount.toFixed(2), px: px };
   } catch (e) {
     devDiag.sharp = 'skip: ' + (e && e.message ? e.message : e);
   }
@@ -1438,15 +1464,17 @@ async function focusBurst(track, opts) {
    快照一份，分辨率等于预览流（我们实测输出 1920×1440），拿不到传感器满幅。
    真正的高分辨率只有一条路：重新协商约束，让采集管线按更大的档位出帧。
    抓完立刻恢复预览档位 —— 大分辨率下帧率会掉，不能一直留着。 */
-async function grabHiRes(track) {
+async function grabHiRes(track, target) {
   if (!track || !track.applyConstraints) return null;
   const capW = (caps.width && caps.width.max) || 0;
   const capH = (caps.height && caps.height.max) || 0;
   if (!capW || !capH) return null;
 
   const curW = video.videoWidth || 0, curH = video.videoHeight || 0;
-  // 上限压到 3000 高：再大 WebView 的预览输出多半不支持，协商失败反而更糟
-  const wantH = Math.min(capH, 3000);
+  // auto（target 为 null）推到设备上限；指定档位就奔目标去。
+  // 上限压到 3000 高：再大 WebView 的预览输出多半不支持，协商失败反而更糟。
+  const bound = Math.min(capH, 3000);
+  const wantH = Math.min(bound, target ? Math.max(target.h, curH) : bound);
   const wantW = Math.min(capW, Math.round(wantH * 4 / 3));
   // 提不上 20% 就没意义，别为几万像素折腾一次黑屏
   if (wantW < curW * 1.2) return null;
@@ -1499,7 +1527,7 @@ async function grabBestImage() {
 
   // ① ImageCapture：若能拿到明显大于预览流的位图，说明是真·传感器满幅，
   //    直接用。否则它只是视频轨快照，跟抓帧没有区别，还可能更慢。
-  if (imageCapture && S.quality === 'high' && typeof imageCapture.takePhoto === 'function') {
+  if (imageCapture && typeof imageCapture.takePhoto === 'function') {
     try {
       const blob = await imageCapture.takePhoto();
       const bmp = await createImageBitmap(blob);
@@ -1523,9 +1551,12 @@ async function grabBestImage() {
     }
   }
 
-  // ② 原生满幅：临时把约束推到最大，抓完恢复
-  if (S.quality === 'high') {
-    const hi = await grabHiRes(trackRef);
+  // ② 高分辨率：临时把约束推到目标档位（auto 就推到设备上限），抓完恢复。
+  //    目标比当前预览还小时不必折腾 —— 预览帧本身就够，多缩一次只是多一道损失。
+  const tgt = stillTarget();
+  const curH = video.videoHeight || 0;
+  if (!tgt || tgt.h > curH * 1.06) {
+    const hi = await grabHiRes(trackRef, tgt);
     if (hi) {
       return {
         src: hi.canvas, w: hi.canvas.width, h: hi.canvas.height,
@@ -1599,6 +1630,14 @@ function composeCanvas(raw) {
 
   let outW = Math.round(zw);
   let outH = Math.round(zh);
+  // 用户指定了分辨率档位：只缩不放。
+  // 源图本身没那么多像素时放大只是把同样信息摊到更多格子上，看着更糊，
+  // 还骗自己「这是 12MP」。这种情况保持原尺寸，诊断里如实显示实际值。
+  const tgt = stillTarget();
+  if (tgt && outW > tgt.w) {
+    outH = Math.round(outH * tgt.w / outW);
+    outW = tgt.w;
+  }
   const MAXW = 4096;
   if (outW > MAXW) {
     outH = Math.round(outH * MAXW / outW);
@@ -1828,6 +1867,12 @@ async function capture() {
     const canvas = composeCanvas(raw);
     lastRaw = cloneCanvas(canvas);   // 未套影调的构图，改水印时重算
     devDiag.out = canvas.width + 'x' + canvas.height;
+    // 选了固定档位却拿不到那么多像素时，如实标出目标值 ——
+    // 否则用户会以为「12MP」生效了，实际只有设备能给的那点
+    const tgtS = stillTarget();
+    if (tgtS && canvas.width !== tgtS.w) {
+      devDiag.out += '（目标 ' + tgtS.w + 'x' + tgtS.h + '）';
+    }
     devDiag.af = raw.afMs != null
       ? (raw.afMs + 'ms / ' + (raw.frames || 1) + '帧')
       : (raw.via === 'capture' ? '原生满幅' : '—');
@@ -2346,7 +2391,7 @@ function syncUI() {
 
   setSeg('segPos', S.pos);
   setSeg('segScale', String(S.wmScale));
-  setSeg('segQuality', S.quality);
+  setSeg('segStill', S.still || 'auto');
   setSeg('segSize', String(S.size));
   setSeg('segView', S.view || 'wide');
   setSeg('segRot', String(S.videoRot || 'auto'));
@@ -2491,7 +2536,7 @@ function bindUI() {
   const segs = [
     ['segPos', v => { S.pos = v; }],
     ['segScale', v => { S.wmScale = Number(v); }],
-    ['segQuality', v => { S.quality = v; }],
+    ['segStill', v => { S.still = v; }],
     ['segSize', v => { S.size = v; }],
     ['segView', v => { S.view = v; }],
     ['segCoord', v => { S.coordFmt = v; }],
@@ -2508,7 +2553,8 @@ function bindUI() {
       syncUI();
       if (id === 'segRot' || id === 'segView') { layoutStage(); renderOverlay(); }
       else renderOverlay();
-      if (id === 'segQuality' || id === 'segSize') startCamera(curDeviceId, { keepLenses: true });
+      // 分辨率只影响按快门时的采集档位，不必重启摄像头
+      if (id === 'segSize') startCamera(curDeviceId, { keepLenses: true });
     });
   });
 
