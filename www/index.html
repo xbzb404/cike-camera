@@ -198,6 +198,16 @@
 
     <h3 class="sec">拍摄</h3>
     <div class="field">
+      <span class="field-label">亮度（拍出来发白就往左拉）</span>
+      <div class="slider-row">
+        <input id="brightSlider" type="range" min="-30" max="30" step="5" value="0">
+        <b id="brightVal">0</b>
+      </div>
+    </div>
+    <div class="switch-list">
+      <label class="switch-item"><span>自动压高光（按画面高光溢出比例自动降亮度）</span><input type="checkbox" id="swTone"><i></i></label>
+    </div>
+    <div class="field">
       <span class="field-label">画质（高画质会用原生满幅拍摄）</span>
       <div class="seg" id="segQuality">
         <button data-v="high">高画质</button>
@@ -274,6 +284,7 @@
 <script src="js/crypto-wmc.js"></script>
 <script src="js/exif.js"></script>
 <script src="js/exif-write.js"></script>
+<script src="js/tone.js"></script>
 <script src="js/wm-core.js"></script>
 <script src="js/native.js"></script>
 <script src="app.js"></script>

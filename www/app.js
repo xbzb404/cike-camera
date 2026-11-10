@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.3.1';
+const APP_VERSION = '1.3.2';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -55,7 +55,9 @@ const DEFAULTS = {
   grid: false,
   level: true,
   timer: 0,             // 0 | 3 | 10
-  ev: 0                 // 曝光补偿
+  ev: 0,                // 硬件曝光补偿（不是所有机型都支持）
+  autoTone: true,       // 自动压高光：成片发白时按亮度分析降一档
+  bright: 0             // 手动亮度补偿，-30 ~ +30（百分比）
 };
 
 function readSettings() {
@@ -144,6 +146,7 @@ function showBusy(t) { showGuard(t || '处理中…', '请稍候'); }
 function hideBusy() { hideGuard(); }
 
 function stopStream() {
+  stopToneLoop();
   if (stream) {
     stream.getTracks().forEach(t => t.stop());
     stream = null;
@@ -189,6 +192,7 @@ async function startCamera(deviceId, opts) {
     await video.play().catch(() => {});
     applyVideoTransform();
     layoutStage();
+    startToneLoop();
     applyEv(S.ev);
 
     if (!keepLenses) await scanLenses(track);
@@ -573,8 +577,71 @@ function sampleVideoInk(pos) {
   return (sum / (px.length / 4) / 255) > 0.62 ? 'light' : 'dark';
 }
 
-async function refreshUiCode() {
+/* ---------- 曝光 / 影调 ----------
+   「拍出来发白」有三个来源，这里一并处理：
+     ① 快门按得太早，AE 还没收敛        → 拍前先空跑几帧；
+     ② Android WebView 的 takePhoto() 偶尔返回偏亮的帧
+                                         → 与同一时刻预览帧比高光溢出比例，明显更白就换成预览帧；
+     ③ 场景本身过曝                     → 按高光溢出比例压一档亮度并补对比度。
+   压暗用 canvas ctx.filter（GPU 合成），作用在水印绘制与签名之前，不影响验真。 */
+let tone = { b: 1, c: 1 };
+let toneTimer = 0;
+let toneCanvas = null;
+
+function statsOf(src) {
+  if (!window.WMCTone || !src) return null;
+  const w = src.videoWidth || src.width || 0;
+  const h = src.videoHeight || src.height || 0;
+  if (!w || !h) return null;
+  const TW = 160;
+  const th = Math.max(1, Math.round(TW * h / w));
+  if (!toneCanvas) toneCanvas = document.createElement('canvas');
+  if (toneCanvas.width !== TW || toneCanvas.height !== th) {
+    toneCanvas.width = TW;
+    toneCanvas.height = th;
+  }
+  const c = toneCanvas.getContext('2d', { willReadFrequently: true });
   try {
+    c.drawImage(src, 0, 0, TW, th);
+    return WMCTone.analyze(c.getImageData(0, 0, TW, th).data, 3);
+  } catch (e) {
+    return null;
+  }
+}
+
+function manualBright() { return 1 + (Number(S.bright) || 0) / 100; }
+
+function toneFilter() {
+  if (!window.WMCTone) return 'none';
+  return WMCTone.cssFilter(tone.b * manualBright(), tone.c);
+}
+
+function applyToneToPreview() {
+  video.style.filter = toneFilter();
+}
+
+/* 从取景器采样，决定当前亮度系数；变化足够大才更新，避免忽明忽暗 */
+function refreshTone(force) {
+  if (!window.WMCTone || !video.videoWidth) return;
+  const s = statsOf(video);
+  if (!s) return;
+  const b = S.autoTone ? WMCTone.brightnessFor(s) : 1;
+  if (!force && !WMCTone.shouldUpdate(tone.b, b)) return;
+  tone = { b, c: WMCTone.contrastFor(b) };
+  applyToneToPreview();
+}
+
+function startToneLoop() {
+  stopToneLoop();
+  refreshTone(true);
+  toneTimer = setInterval(() => { if (!document.hidden) refreshTone(false); }, 1800);
+}
+
+function stopToneLoop() {
+  if (toneTimer) { clearInterval(toneTimer); toneTimer = 0; }
+}
+
+async function refreshUiCode() {  try {
     const pub = await WMC.getPublic();
     const b = liveBase();
     const core = { v: 1, kid: pub.kid, ts: b.time.toISOString(), lat: b.lat, lng: b.lng, src: b.src, addr: b.addr || '' };
@@ -697,13 +764,21 @@ function sharpness(canvas) {
  * 取图：优先原生满幅，失败退预览帧（多帧择优）
  * @returns {Promise<{src:CanvasImageSource,w:number,h:number,via:string,score:number}>}
  */
+/* 先让相机空跑几帧：AE/AWB 没收敛就按快门，成片常常一片惨白 */
+async function warmUp(frames) {
+  const n = Math.max(1, frames || 3);
+  for (let i = 0; i < n; i++) await nextFrame();
+}
+
 async function grabBestImage() {
+  await warmUp(3);
+
   // ① ImageCapture：拿到的是传感器满分辨率原图，画质最好
   if (imageCapture && S.quality === 'high' && typeof imageCapture.takePhoto === 'function') {
     try {
       const blob = await imageCapture.takePhoto();
       const bmp = await createImageBitmap(blob);
-      return { src: bmp, w: bmp.width, h: bmp.height, via: 'capture', score: 0 };
+      return { src: bmp, w: bmp.width, h: bmp.height, via: 'capture', score: 0, stats: statsOf(bmp) };
     } catch (e) {
       // 部分 WebView / 机型不支持，静默降级
     }
@@ -721,7 +796,7 @@ async function grabBestImage() {
     const sc = sharpness(f);
     if (sc > bestScore) { bestScore = sc; best = f; }
   }
-  return { src: best, w: best.width, h: best.height, via: 'video', score: bestScore };
+  return { src: best, w: best.width, h: best.height, via: 'video', score: bestScore, stats: statsOf(best) };
 }
 
 /* cover 裁剪：让源图按目标比例居中裁切 */
@@ -770,7 +845,11 @@ function composeCanvas(raw) {
     ctx.translate(outW, 0);
     ctx.scale(-1, 1);
   }
+  // 影调修正：与取景器上所见的亮度保持一致（CSS filter 不会影响 drawImage，这里要显式再来一次）
+  const tf = toneFilter();
+  if (tf !== 'none') ctx.filter = tf;
   ctx.drawImage(raw.src, zx, zy, zw, zh, 0, 0, outW, outH);
+  ctx.filter = 'none';
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   return canvas;
 }
@@ -920,7 +999,19 @@ async function capture() {
     shutterFlash();
     showBusy('正在成像…');
 
-    const raw = await grabBestImage();
+    let raw = await grabBestImage();
+
+    // takePhoto() 在部分机型上比预览帧明显更白（高光大片溢出）。
+    // 同一时刻再抓一帧对比，原生图更糟就改用预览帧，宁可少点分辨率也不要白片。
+    if (raw.via === 'capture' && window.WMCTone) {
+      const frame = grabFrame();
+      const fs = statsOf(frame);
+      if (WMCTone.shouldReplacePhoto(raw.stats, fs)) {
+        raw = { src: frame, w: frame.width, h: frame.height, via: 'video', stats: fs };
+        console.info('[wmc] takePhoto 偏亮，已改用预览帧', raw.stats && raw.stats.blown, fs && fs.blown);
+      }
+    }
+
     const base = liveBase();
 
     const canvas = composeCanvas(raw);
@@ -1417,11 +1508,19 @@ function syncUI() {
     swTime: 'showTime', swSeconds: 'showSeconds', swPlace: 'showPlace',
     swCoords: 'showCoords', swWeather: 'showWeather', swCode: 'showCode',
     swGcj: 'coordGcj', swAlt: 'showAltitude', swAcc: 'showAccuracy',
-    swInk: 'autoInk', swExif: 'writeExif', swSmart: 'smartPick', swGrid: 'grid'
+    swInk: 'autoInk', swExif: 'writeExif', swSmart: 'smartPick', swGrid: 'grid',
+    swTone: 'autoTone'
   };
   for (const id in map) {
     const el = document.getElementById(id);
     if (el) el.checked = !!S[map[id]];
+  }
+
+  const bs = $('#brightSlider');
+  if (bs) {
+    bs.value = String(S.bright || 0);
+    const bv = $('#brightVal');
+    if (bv) bv.textContent = (S.bright > 0 ? '+' : '') + (S.bright || 0);
   }
 
   const nameEl = $('#styleName');
@@ -1565,7 +1664,8 @@ function bindUI() {
     ['#swTime', 'showTime'], ['#swSeconds', 'showSeconds'], ['#swPlace', 'showPlace'],
     ['#swCoords', 'showCoords'], ['#swWeather', 'showWeather'], ['#swCode', 'showCode'],
     ['#swGcj', 'coordGcj'], ['#swAlt', 'showAltitude'], ['#swAcc', 'showAccuracy'],
-    ['#swInk', 'autoInk'], ['#swExif', 'writeExif'], ['#swSmart', 'smartPick']
+    ['#swInk', 'autoInk'], ['#swExif', 'writeExif'], ['#swSmart', 'smartPick'],
+    ['#swTone', 'autoTone']
   ];
   toggles.forEach(([sel, key]) => {
     const el = $(sel);
@@ -1573,10 +1673,24 @@ function bindUI() {
     el.addEventListener('change', e => {
       S[key] = e.target.checked;
       saveSettings();
+      if (key === 'autoTone') refreshTone(true);
       renderOverlay();
       if (key === 'grid') applyGrid();
     });
   });
+
+  // 亮度滑块：实时作用到取景器，拍下来也按这个系数出片
+  const bs = $('#brightSlider');
+  if (bs) {
+    const onMove = () => {
+      S.bright = Number(bs.value) || 0;
+      const bv = $('#brightVal');
+      if (bv) bv.textContent = (S.bright > 0 ? '+' : '') + S.bright;
+      applyToneToPreview();
+    };
+    bs.addEventListener('input', onMove);
+    bs.addEventListener('change', () => { onMove(); saveSettings(); });
+  }
 
   // 分段选择器
   const segs = [

@@ -124,7 +124,8 @@ const LNG = 121.473701;
     const good = await WMC.verifySig(seg.pub || {}, target, WMC.fromB64url(seg.sig));
     ok('ECDSA 签名验签通过', good);
     ok('签名段记录的分辨率合理', seg.dev && seg.dev.w > 0 && seg.dev.h > 0, seg.dev ? `${seg.dev.w}x${seg.dev.h}` : '');
-    ok('签名段版本号 = 1.3.0', !!(seg.dev && seg.dev.ver === '1.3.0'), seg.dev && seg.dev.ver);
+    const appVer = (/APP_VERSION\s*=\s*'([^']+)'/.exec(fs.readFileSync(path.join(__dirname, '..', 'www', 'app.js'), 'utf8')) || [])[1];
+    ok('签名段版本号与 app.js 一致（' + appVer + '）', !!(seg.dev && seg.dev.ver === appVer), seg.dev && seg.dev.ver);
   }
 
   ok('运行期无 JS 错误', errors.length === 0, errors.slice(0, 3).join(' | '));
