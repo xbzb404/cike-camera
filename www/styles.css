@@ -919,25 +919,28 @@ body.full .stage-wrap{
 body.full .stage-col{gap:0;position:absolute;inset:0;width:auto;height:auto}
 body.full .stage{border-radius:0;max-width:none;max-height:none}
 
-/* 全屏时的退出按钮：浮在右上角，跟着 #app 一起转，方向永远是对的 */
+/* 全屏时的退出按钮：浮在右上角，跟着 #app 一起转，方向永远是对的。
+   无底色 —— 和其它控件一样纯图标浮在画面上，靠投影勾边。 */
 #btnExitFull{
   display:none;
   position:absolute;z-index:9;
-  top:calc(8px + env(safe-area-inset-top, 0px));right:10px;
-  width:38px;height:38px;padding:0;border-radius:12px;
+  top:calc(6px + env(safe-area-inset-top, 0px));right:6px;
+  width:42px;height:42px;padding:0;border-radius:12px;
   align-items:center;justify-content:center;
-  background:rgba(10,14,20,.56);
-  border:1px solid rgba(255,255,255,.16);
-  color:#eef4ff;
-  -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);
+  background:none;
+  border:0;
+  color:#fff;
+  filter:drop-shadow(0 1px 2px rgba(0,0,0,.9)) drop-shadow(0 0 5px rgba(0,0,0,.5));
 }
 body.full #btnExitFull{display:flex}
-#btnExitFull:active{background:rgba(10,14,20,.78)}
+#btnExitFull:active{background:rgba(255,255,255,.14)}
 
+/* 底部不再铺那条黑到透明的渐变 —— 全屏取景时它会压出一道色带，
+   快门和相册按钮直接浮在画面上就好。 */
 body.full .controls{
   position:absolute;left:0;right:0;bottom:0;
   padding:8px 0 calc(6px + var(--safe-b));
-  background:linear-gradient(to top, rgba(4,6,10,.66), rgba(4,6,10,0));
+  background:none;
   pointer-events:none;
   gap:40px;
 }
@@ -960,7 +963,11 @@ body.land:not(.full) .stage-col{position:relative;gap:0}
 body.full .bars{
   position:absolute;z-index:6;
   top:calc(52px + env(safe-area-inset-top, 0px));left:8px;right:auto;
-  width:auto;max-width:calc(100% - 96px);
+  /* max-content + max-width：先按内容撑开，超宽了再靠 wrap 换行。
+     写成 width:auto 时 .toolbar 的 max-width:100% 会和父级的收缩宽度
+     互相求解，解出一个很窄的值，于是胶囊被压扁、第一个只露半截。 */
+  width:max-content;
+  max-width:calc(100% - 96px);
   flex-direction:row;flex-wrap:wrap;align-items:flex-start;gap:6px;
   padding:0;background:none;
 }
@@ -987,6 +994,45 @@ body.land .side-btn{width:44px;gap:0}
 body.land .side-btn span{display:none}
 body.land .side-btn svg{width:20px;height:20px}
 body.full .level-wrap{width:min(42%,200px)}
+
+/* ---------- 全屏：控件一律透明，图标直接浮在画面之上 ----------
+   以前顶栏、工具条、快门各带一块半透明底板或底部渐变，非全屏时它们在
+   文档流里各占一行还看不出来；一旦全屏，这些底板就变成压在取景画面上的
+   灰色块。全屏下全部去掉底色，靠投影让图标在任何画面上都看得清
+   （1px 深色投影勾边，比铺一块底板更不挡画面）。 */
+body.full .icon-btn,
+body.full .tool,
+body.full .ev,
+body.full .style-btn{
+  background:none;
+  box-shadow:none;
+  filter:drop-shadow(0 1px 2px rgba(0,0,0,.88)) drop-shadow(0 0 6px rgba(0,0,0,.42));
+}
+body.full .icon-btn{border-color:transparent}
+/* 工具胶囊只有文字，留一圈极淡白边让人知道哪里能点 */
+body.full .tool,
+body.full .ev,
+body.full .style-btn{border-color:rgba(255,255,255,.22)}
+/* 激活态（网格开、EV 非 0、样式名）保留琥珀实底 —— 全屏里这是唯一
+   需要一眼看出来的状态，不能也透明掉 */
+body.full .tool.on,
+body.full .style-btn:active{
+  background:var(--accent);
+  border-color:var(--accent);
+  color:#141414;
+  filter:none;
+}
+body.full .tool.on b,
+body.full .style-btn:active b{color:#141414}
+body.full .toolbar{
+  background:none;padding:0;
+  flex:0 1 auto;flex-wrap:wrap;overflow:visible;max-width:100%;
+}
+/* 快门白圈、相册/切换图标同理：亮场景里纯白会糊，给投影 */
+body.full .shutter,
+body.full .side-btn{
+  filter:drop-shadow(0 1px 3px rgba(0,0,0,.82)) drop-shadow(0 0 9px rgba(0,0,0,.45));
+}
 
 /* ---------- 横竖切换 / 进出全屏的过渡 ----------
    尺寸硬跳变看着就是「卡一下」，这里给取景框和浮层加 260ms 缓动。
