@@ -883,13 +883,15 @@ textarea::placeholder{color:#5d6675}
 .preview-bar .btn-primary,.preview-bar .btn-ghost{padding-left:14px;padding-right:14px;font-size:13px}
 
 
-/* ---------- 横屏（由 JS 的陀螺仪判定驱动） ----------
-   注意：不能用 @media (orientation:landscape) —— 壳把 Activity 钉死在
-   竖屏，系统永远不会给出横屏视口，那个媒体查询在本 App 里是死的。
-   现在由 app.js 读陀螺仪后给 <body> 加 .land / .q90 / .q270，
-   整个 #app 用 CSS 旋转 90°，等于自己实现了一次屏幕旋转。 */
+/* ---------- 横竖屏 ----------
+   1.4.8 起壳的 screenOrientation 是 10（fullSensor）：手机转过去系统自己
+   把窗口转过来，WebView 拿到真正的横屏视口，摄像头也给横版的流。所以
+   这里**正常情况下不需要 CSS 旋转**，.land 只负责横屏的排版细节。
 
-/* 顺时针转：宽高互换后，rotate(90) + 右移一个自身高度，正好铺满视口 */
+   .q90 / .q270 是兜底：个别 ROM 不给转窗口时，自己把 #app 转 90°。
+   转的时候宽高必须对调，否则会被压成一条。 */
+
+/* 顺时针转：宽高互换后，rotate(90) + 上移一个自身宽度，正好铺满视口 */
 body.q90 #app{
   position:fixed;left:0;top:0;
   width:100vh;height:100vw;
@@ -904,57 +906,108 @@ body.q270 #app{
   transform:rotate(-90deg) translateX(-100%);
 }
 
-/* 横屏时高度只剩一半，原来那套竖排留白会把取景器压成一条缝。
-   这里压掉纵向内边距、把工具条收紧成纯图标，把高度还给画面。 */
-body.land #app{position:fixed;inset:0;overflow:hidden;padding-top:0}
+/* 全屏取景：顶栏、工具条、快门全部变成浮层压在画面上，取景吃满整屏。
+   竖屏横屏都套这一套 —— 非全屏时这些元素仍然各占一行，不浮层。 */
+body.full #app{position:fixed;inset:0;overflow:hidden;padding-top:0}
 /* 画面就是整块屏幕：取景容器铺满，顶栏/工具条/快门全是浮层。
    以前这里只写了 padding:0，容器仍是文档流里的 flex 子项，
    旋转后拿到的可用高度是旧值，取景框就被压成一条横带。 */
-body.land .stage-wrap{
+body.full .stage-wrap{
   position:absolute;inset:0;padding:0;
   display:flex;align-items:center;justify-content:center;
 }
-body.land .stage-col{gap:0;position:absolute;inset:0;width:auto;height:auto}
-body.land .stage{border-radius:0;max-width:100%;max-height:100%}
+body.full .stage-col{gap:0;position:absolute;inset:0;width:auto;height:auto}
+body.full .stage{border-radius:0;max-width:none;max-height:none}
 
-body.land .controls{
+/* 全屏时的退出按钮：浮在右上角，跟着 #app 一起转，方向永远是对的 */
+#btnExitFull{
+  display:none;
+  position:absolute;z-index:9;
+  top:calc(8px + env(safe-area-inset-top, 0px));right:10px;
+  width:38px;height:38px;padding:0;border-radius:12px;
+  align-items:center;justify-content:center;
+  background:rgba(10,14,20,.56);
+  border:1px solid rgba(255,255,255,.16);
+  color:#eef4ff;
+  -webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);
+}
+body.full #btnExitFull{display:flex}
+#btnExitFull:active{background:rgba(10,14,20,.78)}
+
+body.full .controls{
   position:absolute;left:0;right:0;bottom:0;
   padding:8px 0 calc(6px + var(--safe-b));
   background:linear-gradient(to top, rgba(4,6,10,.66), rgba(4,6,10,0));
   pointer-events:none;
   gap:40px;
 }
-body.land .controls>*{pointer-events:auto}
+body.full .controls>*{pointer-events:auto}
 
-/* 工具条浮到左上，且只占左侧不到一半宽度 ——
-   右边整块留给水印（横屏时水印自动挪到右上角），互不遮挡。
+/* 横屏时纵向空间本来就紧张（手机横过来只有一千来像素高），工具条
+   不能再单独占一行，否则取景会被挤成一条横带。这里让它浮到画面左上，
+   只占左侧不到一半宽度 —— 右边整块留给水印（横屏时水印自动挪到右上角）。
    去掉 backdrop-filter：横屏每帧都要额外做一次模糊，属于纯浪费。 */
 body.land .bars{
-  position:absolute;top:50px;left:8px;right:auto;z-index:6;
-  width:auto;max-width:46%;
+  position:absolute;top:6px;left:6px;right:auto;z-index:6;
+  width:auto;max-width:52%;
   flex-direction:row;align-items:flex-start;gap:6px;
   padding:0;background:none;
 }
-body.land .toolbar{background:rgba(10,14,20,.42);padding:2px 5px;gap:2px}
+/* 非全屏时 .stage-col 还在文档流里，要给绝对定位的工具条一个参照系；
+   全屏时它已经是 absolute inset:0，别覆盖 */
+body.land:not(.full) .stage-col{position:relative;gap:0}
+/* 全屏：顶栏浮在最上面，工具条就往下让出它的高度（竖屏、横屏同理） */
+body.full .bars{
+  position:absolute;z-index:6;
+  top:calc(52px + env(safe-area-inset-top, 0px));left:8px;right:auto;
+  width:auto;max-width:calc(100% - 96px);
+  flex-direction:row;flex-wrap:wrap;align-items:flex-start;gap:6px;
+  padding:0;background:none;
+}
+body.land .toolbar{background:rgba(10,14,20,.46);padding:2px 5px;gap:2px}
 body.land .tool{padding:5px 8px;gap:0}
 body.land .tool span{display:none}
 body.land .style-btn{padding:5px 10px;font-size:12px;gap:5px}
 body.land .style-btn b{font-size:11px}
 
-body.land .topbar{
+body.full .topbar{
   position:absolute;top:0;left:0;right:auto;z-index:7;
   padding:6px 10px;gap:8px;
   background:none;
   pointer-events:none;
 }
-body.land .topbar>*{pointer-events:auto}
+body.full .topbar>*{pointer-events:auto}
 /* 横屏不显示标题：转 90° 之后它会变成一竖行贴边文字，纯属干扰 */
-body.land .brand{display:none}
-body.land .icon-btn{width:32px;height:32px}
+body.full .brand{display:none}
+body.land .icon-btn{width:34px;height:34px}
 
 body.land .shutter{width:56px;height:56px}
 body.land .shutter span{width:44px;height:44px}
 body.land .side-btn{width:44px;gap:0}
 body.land .side-btn span{display:none}
 body.land .side-btn svg{width:20px;height:20px}
-body.land .level-wrap{width:min(42%,200px)}
+body.full .level-wrap{width:min(42%,200px)}
+
+/* ---------- 横竖切换 / 进出全屏的过渡 ----------
+   尺寸硬跳变看着就是「卡一下」，这里给取景框和浮层加 260ms 缓动。
+   .layout-anim 只在切换那一刻挂 460ms：平时拖窗口 / 软键盘弹出不该有动画，
+   否则每一帧都跟着缓动，反而更卡。 */
+body.layout-anim .stage{
+  transition:
+    width .26s cubic-bezier(.22,.68,.28,1),
+    height .26s cubic-bezier(.22,.68,.28,1),
+    border-radius .24s ease;
+}
+body.layout-anim .stage-wrap,
+body.layout-anim .controls,
+body.layout-anim .bars,
+body.layout-anim .topbar{
+  transition:opacity .22s ease, transform .26s cubic-bezier(.22,.68,.28,1);
+}
+@media (prefers-reduced-motion:reduce){
+  body.layout-anim .stage,
+  body.layout-anim .stage-wrap,
+  body.layout-anim .controls,
+  body.layout-anim .bars,
+  body.layout-anim .topbar{transition:none}
+}

@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.4.7';
+const APP_VERSION = '1.4.8';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -38,6 +38,7 @@ const DEFAULTS = {
   autoPos: true,        // 横屏时自动把水印挪到空着的角落
   size: '1080',         // 预览流长边：720 | 1080 | 1440
   view: 'fill',         // fill 填满取景框（默认，取景框尽量大）| wide 完整视角
+  full: false,          // 全屏取景（只能手动开，退出用右上角按钮）
   wmScale: 1,           // 0.85 | 1 | 1.15
   autoInk: true,        // 按底图亮度自动切深/浅墨水
   fields: [],           // 自定义字段 [{k,v}]
@@ -111,6 +112,11 @@ function readSettings() {
     s.stillMigrated = true;
   }
   if (!['auto', '12', '8', '5', '2'].includes(String(s.still))) s.still = 'auto';
+  // 1.4.8：窗口改成系统真旋转（fullSensor），画面方向由 display rotation
+  // 决定。老版本里为了把躺倒的画面扳正而手动设过 90/270 的，一次性清回
+  // auto，否则会和系统旋转叠成 180°（「UI 倒了 / 画面不跟着转」的源头之一）。
+  if (!s.videoRotMigrated) { s.videoRot = 'auto'; s.videoRotMigrated = true; }
+  if (typeof s.full !== 'boolean') s.full = false;
   return s;
 }
 
@@ -327,9 +333,18 @@ function targetFps() {
    ② 绝不给 aspectRatio。理由同上：它会让浏览器用裁切来凑比例。
 
    帧率按屏幕刷新率给，用户那块 120Hz 屏不该只跑 30。 */
+/* 横屏时如果摄像头仍给竖版的流（部分机型不跟 display rotation 走），
+   取景框是宽的、流是高的，cover 会把画面横向放大成中间一条竖带 ——
+   看起来就是「视角根本没切换」。这时候把请求的宽高对调再要一次。
+   只做一次（用 key 记住这个方向已经试过），避免来回重启摄像头。 */
+let streamFlip = false;
+let aspectFixKey = '';
+let streamFixTimer = 0;
+
 function streamConstraint() {
-  const h = Number(S.size) || 1080;
-  const w = Math.round(h * 4 / 3);
+  let h = Number(S.size) || 1080;
+  let w = Math.round(h * 4 / 3);
+  if (streamFlip) { const t = w; w = h; h = t; }
   return {
     width: { ideal: w },
     height: { ideal: h },
@@ -430,6 +445,8 @@ async function startCamera(deviceId, opts) {
 
     updateToolCaps();
     camStarting = false;
+    // 首帧稳定后校验一次「流的方向和窗口方向是否一致」，不一致会自己修
+    setTimeout(checkStreamOrient, 700);
     return true;
   } catch (err) {
     camStarting = false;
@@ -734,40 +751,58 @@ function updateToolCaps() {
    ============================================================ */
 /* 方向状态。
    ------------------------------------------------------------
-   1.4.7 起壳的 AndroidManifest 把 screenOrientation 从 1（钉死竖屏）
-   改成 13（fullUser）：系统会真的把窗口转过去，WebView 拿到真正的
-   横屏视口，摄像头也才会给出横版的流（这是「横屏预览框不变宽」的根因 ——
-   窗口不转时 WebKit 永远按竖屏输出画面，横过来只能得到一条竖带）。
+   1.4.8 起壳的 screenOrientation 是 10（fullSensor）：四个方向全跟随
+   重力，而且**无视系统「自动旋转」开关**。所以正常路径是系统自己转窗口，
+   摄像头也跟着给横版的流，我们什么都不用转。
 
-   所以正常路径是「系统自己转，我们什么都不用做」；
-   只有两种兜底情况还需要 CSS 转 90°：
-     · 用户点了左上角「锁定方向」，或者系统开了旋转锁 —— 窗口不转；
-     · 个别机型窗口转了但 WebView 不跟着 resize。
-   转的时候按设备重力方向决定转哪一边（转错方向会整个上下颠倒）。 */
+   1.4.7 用的是 13（fullUser），它会尊重用户的旋转锁 —— 手机上关掉自动
+   旋转的人，窗口永远不动，界面只能自己 CSS 转 90°，于是「UI 倒了、
+   视角没转」全来了。这是那一版翻车的真正原因。
+
+   现在的原则：**能不自己转就不自己转**。
+     · 窗口真的横了（innerWidth > innerHeight）→ 什么都不做；
+     · 陀螺仪说横了、窗口还没转 → 先等 380ms 看系统转不转，转了就算了，
+       没转（个别 ROM 不给面子）才 CSS 转 90° 兜底。
+   转的时候方向按重力算，转错会上下颠倒 —— 这里修过一次符号。 */
 const orient = {
   auto: true,       // 是否跟随设备
-  q: 0,             // 0 竖 / 90 / -90 横 / 180 倒置
+  q: 0,             // 设备姿态：0 竖 / 90 / -90 横 / 180 倒置
   lockedQ: 0,       // 锁定时的方向
   cand: 0, candN: 0,// 候选方向与连续命中次数（防抖）
   hasSensor: false
 };
 
-/* 当前应该按哪个方向排版。
-   锁定值 > 窗口真实方向 > 陀螺仪（手机放平时陀螺仪没有横竖概念，
-   此时必须信窗口）。 */
-function isLandscape() {
+let selfRot = 0;          // 我们自己把 #app 转了多少度（0 = 没转）
+let logicalLand = false;  // 当前界面按横屏还是竖屏排版
+let pendLand = null;      // 设备已经转过去、但系统窗口还没转的过渡态
+let rotTimer = 0;
+let animTimer = 0;
+
+function winLand() { return window.innerWidth > window.innerHeight; }
+function deviceLand() { return orient.q === 90 || orient.q === -90; }
+
+/* 目标方向。
+   ------------------------------------------------------------
+   关键：**窗口方向永远优先**。壳是 fullSensor，系统自己会转窗口，
+   而且它比我们晚 3 帧的陀螺仪读数更可靠。只有「陀螺仪说转了、窗口
+   还没转」这个过渡态（pendLand）才听传感器的 —— 那是给自己留的
+   兜底，用来在个别不转窗口的 ROM 上手动 CSS 转 90°。
+   以前这里让传感器盖过窗口，结果系统刚转完、陀螺仪还是旧值时，
+   界面又被反向转回去，就成了「UI 倒过来」。 */
+function targetLand() {
   if (!orient.auto) return orient.lockedQ === 90 || orient.lockedQ === -90;
-  if (window.innerWidth > window.innerHeight) return true;
-  return orient.hasSensor && (orient.q === 90 || orient.q === -90);
+  if (pendLand !== null) return pendLand;
+  return winLand();
 }
 
-/* #app 的布局空间。
-   自己转 90° 时 CSS 把宽高换成了 100vh/100vw，此时去量 clientWidth
-   会读到旋转前的旧值（这就是之前取景框莫名变成一小条的元凶），
-   所以这里直接用视口尺寸推算，不依赖任何测量。 */
+/* 当前界面按哪个方向排版 */
+function isLandscape() { return logicalLand; }
+
+/* #app 的布局空间。自己转过 90° 时 CSS 把宽高换成了 100vh/100vw，
+   这时去量 clientWidth 会读到旋转前的旧值（取景框被压成一小条就是
+   这么来的），所以直接用视口尺寸推算，不依赖任何测量。 */
 function appSpace() {
-  const rot = document.body.classList.contains('q90') || document.body.classList.contains('q270');
-  return rot
+  return selfRot
     ? { w: window.innerHeight, h: window.innerWidth }
     : { w: window.innerWidth, h: window.innerHeight };
 }
@@ -780,27 +815,44 @@ function toQuarter(deg) {
   return 0;
 }
 
-let lastLandQ = null;
-let orientReopenTimer = 0;
+function applyOrientation(opts) {
+  const gyro = !!(opts && opts.gyro);
+  const want_land = targetLand();
 
-function applyOrientation() {
-  const body = document.body;
-  const land = isLandscape();
-  const actualLand = window.innerWidth > window.innerHeight;
-  // 目标方向和窗口方向不一致时才需要自己转
-  let deg = 0;
-  if (land !== actualLand) {
-    deg = toQuarter(land ? -orient.q : orient.lockedQ - orient.q);
+  // 自己转的角度：只有「目标方向和窗口方向不一致」时才需要转
+  let want = 0;
+  if (want_land !== winLand()) {
+    const q = (orient.q === 90 || orient.q === -90) ? orient.q : 90;
+    // 设备横着、窗口还竖着 → 按重力方向转 ±90（截图验证过：方向取反就会
+    // 上下颠倒）。窗口横、目标竖（少见）→ 反过来转。
+    want = want_land ? q : -q;
   }
-  body.classList.toggle('q90', deg === 90);
-  body.classList.toggle('q270', deg === -90);
-  body.classList.toggle('land', land);
+
+  // 陀螺仪先报「横了」，窗口可能下一帧才转。这时候立刻自己转 90° 就会
+  // 出现「先闪一下转过去、再被系统转回来」的双重旋转，看起来又卡又乱。
+  // 先等 380ms：系统转了 resize 会来，自己就不用转了。
+  if (gyro && want !== selfRot) {
+    clearTimeout(rotTimer);
+    rotTimer = setTimeout(() => { rotTimer = 0; applyOrientation(); }, 380);
+    return;
+  }
+  clearTimeout(rotTimer);
+  rotTimer = 0;
+
+  selfRot = want;
+  logicalLand = want ? want_land : winLand();
+
+  const body = document.body;
+  body.classList.toggle('q90', want === 90);
+  body.classList.toggle('q270', want === -90);
+  body.classList.toggle('selfrot', want !== 0);
+  body.classList.toggle('land', logicalLand);
 
   // 旋转时把 #app 的宽高写成显式像素，别让 CSS 的 100vh/100vw 在某些
   // WebView 上算偏（写死之后 layoutStage 的推算和实际盒子一定一致）
   const appEl = $('#app');
   if (appEl) {
-    if (deg) {
+    if (want) {
       appEl.style.width = window.innerHeight + 'px';
       appEl.style.height = window.innerWidth + 'px';
     } else {
@@ -809,29 +861,40 @@ function applyOrientation() {
     }
   }
 
-  // 旋转会改变可用宽高，等一帧再排
+  // 旋转会改变可用宽高，等一帧再排。排之前先挂上 .layout-anim，
+  // 让取景框尺寸 / 控件位移走 260ms 缓动 —— 直接跳变看着太生硬。
   requestAnimationFrame(() => {
+    document.body.classList.add('layout-anim');
     layoutStage();
     renderOverlay();
     paintStyleThumbs();
+    clearTimeout(animTimer);
+    animTimer = setTimeout(() => document.body.classList.remove('layout-anim'), 460);
   });
 
-  // 横竖切换后要按新方向重新协商一路流：竖屏拿着 3:4 的流去横屏取景，
-  // 画面只占中间一条（横向视野拿不到，拍出来也是竖构图）。延迟一点再切，
-  // 避免手抖来回转时反复开关摄像头。
-  const landChanged = lastLandQ !== null && lastLandQ !== land;
-  lastLandQ = land;
-  if (!landChanged) return;
-  clearTimeout(orientReopenTimer);
-  orientReopenTimer = setTimeout(() => {
-    if (camStarting || resuming || busy) return;
-    if (!video.srcObject) return;
-    startCamera(curDeviceId, { keepLenses: true });
-  }, 480);
+  // 横屏后如果摄像头给的还是竖版的流（cover 会横向放大成一条竖带，
+  // 看起来就是「视角没切换」），补一次校正。延迟一点，等首帧到。
+  clearTimeout(streamFixTimer);
+  streamFixTimer = setTimeout(checkStreamOrient, 420);
+}
+
+/* 横屏后校验一眼：摄像头给的流有没有跟着转过来。
+   横取景框 + 竖流的组合在 cover 下会被放大成中间一条竖带，也就是用户说的
+   「切到横屏了但视角没切换」。发现这种情况就把请求宽高对调重启一次。 */
+function checkStreamOrient() {
+  if (!video.videoWidth || !video.videoHeight) return;
+  if (camStarting || resuming || busy) return;
+  if (!(video.videoHeight > video.videoWidth && winLand())) return;
+  const key = (winLand() ? 'L' : 'P') + (selfRot ? 's' : 'n');
+  if (aspectFixKey === key) return;
+  aspectFixKey = key;
+  streamFlip = !streamFlip;
+  if (!video.srcObject) return;
+  startCamera(curDeviceId, { keepLenses: true });
 }
 
 /* 重力单位向量（W3C DeviceOrientation 规范）。
-   竖立正对用户 → beta≈90，gy≈-1；顶部朝左横放 → gamma≈-90，gx≈+1。 */
+   竖立正对用户 → beta≈90，gy≈-1；左右横放 → gamma≈±90，gx≈∓1。 */
 function gravityOf(beta, gamma) {
   const b = (beta || 0) * Math.PI / 180;
   const g = (gamma || 0) * Math.PI / 180;
@@ -843,13 +906,12 @@ function gravityOf(beta, gamma) {
 }
 
 function angleFromGravity(gx, gy) {
+  const mag = Math.hypot(gx, gy);
+  if (mag < 0.5) return -1;         // 手机平放，陀螺仪对横竖没有发言权
   if (Math.abs(gy) >= Math.abs(gx)) {
     return gy < 0 ? 0 : 180;        // 正立 / 倒置
   }
-  // gx<0：重力落在机身左侧（-x）→ 手机顶部朝左横放（左横）；
-  // gx>0：顶部朝右（右横）。这里只负责判断「设备现在是哪个姿态」，
-  // 具体要把界面转多少度由 applyOrientation 决定（曾经在这里把方向
-  // 判断反了，结果整个界面转了 180°，横屏看着就是上下颠倒）。
+  // gx>0：重力落在机身右侧 → 右边朝下 → 顶部朝左横放
   return gx > 0 ? 90 : -90;
 }
 
@@ -863,22 +925,39 @@ function initOrientation() {
     orient.hasSensor = true;
     const { gx, gy } = gravityOf(e.beta, e.gamma);
     const q = angleFromGravity(gx, gy);
-    // 防抖：连续 3 次（约 150ms）同一方向才认，避免手抖来回跳
+    if (q === -1) return;               // 平放，保持上一次的姿态
     if (q === orient.cand) orient.candN++;
     else { orient.cand = q; orient.candN = 1; }
-    if (orient.candN < 3) return;
+    if (orient.candN < 3) return;       // 连续 3 帧同一方向才认，防手抖
     if (q === orient.q) return;
-    orient.q = q;                 // 锁定时也要记，锁定方向要靠它算回转角度
+    orient.q = q;
     if (!orient.auto) return;
-    applyOrientation();
+
+    const dLand = deviceLand();
+    if (dLand === winLand()) {
+      // 系统已经转过来了（或本来就方向一致），不需要自己转
+      pendLand = null;
+      applyOrientation();
+      return;
+    }
+    // 设备转了、窗口没转：先挂起，等 380ms 看系统转不转
+    pendLand = dLand;
+    applyOrientation({ gyro: true });
   };
 
   window.addEventListener('deviceorientation', onOrient, true);
-  // 窗口尺寸变了（系统旋转窗口 / 分屏 / 软键盘 / 桌面端拉伸），
-  // 方向判定要跟着重算 —— 以前这里只在没陀螺仪时才看一眼视口比例，
-  // 结果系统真把窗口转了之后 .land 还挂着旧值，取景框就缩成一条。
+  // 窗口尺寸变了（系统旋转窗口 / 分屏 / 桌面端拉伸）→ 立刻重排。
+  // 只有窗口方向真的跟 pendLand 一致了，才作废「等系统转」的状态；
+  // 软键盘之类不改方向的 resize 不能把兜底旋转给取消掉。
   window.addEventListener('resize', () => {
+    clearTimeout(rotTimer);
+    rotTimer = 0;
+    if (pendLand !== null && winLand() === pendLand) pendLand = null;
     applyOrientation();
+  });
+  // 个别 WebView 转窗口时不发 resize，只发 orientationchange
+  window.addEventListener('orientationchange', () => {
+    setTimeout(applyOrientation, 60);
   });
 }
 
@@ -896,9 +975,10 @@ async function requestOrientPermission() {
 
 function setOrientAuto(on) {
   orient.auto = on;
+  pendLand = null;
   if (!on) {
     // 锁的是「现在看到的这个方向」，而不是陀螺仪读数（手机平放时读数是 0）
-    orient.lockedQ = isLandscape()
+    orient.lockedQ = logicalLand
       ? ((orient.q === 90 || orient.q === -90) ? orient.q : 90)
       : 0;
     toast('已锁定：' + (orient.lockedQ ? '横屏' : '竖屏') + '（手机转动不再跟随）');
@@ -910,9 +990,27 @@ function setOrientAuto(on) {
   syncTools();
 }
 
+/* 全屏取景（手动开关）。
+   ------------------------------------------------------------
+   非全屏：顶栏 / 工具条 / 快门都在文档流里各占一行，画面拿到剩下的
+   全部高度；手机横过来时窗口自己转（screenOrientation=fullSensor），
+   界面按横屏正常排版，水印自动挪到空着的角落 —— 旋转的意义只是「换个
+   水印位置」，不折腾界面。
+   全屏：顶栏、工具条、快门全部变成浮层压在画面上，取景吃满整屏，
+   竖屏横屏都成立。 */
+function setFull(on) {
+  S.full = !!on;
+  saveSettings();
+  document.body.classList.toggle('full', S.full);
+  applyOrientation();
+  syncTools();
+  toast(S.full ? '全屏取景（点右上角按钮退出）' : '已退出全屏');
+}
+
 function layoutStage() {
-  const land = isLandscape();
-  const rot = document.body.classList.contains('q90') || document.body.classList.contains('q270');
+  const land = logicalLand;
+  const rot = selfRot !== 0;
+  const full = !!S.full;
   const cs = getComputedStyle(stageWrap);
   const padL = parseFloat(cs.paddingLeft) || 0;
   const padR = parseFloat(cs.paddingRight) || 0;
@@ -920,13 +1018,14 @@ function layoutStage() {
   const padB = parseFloat(cs.paddingBottom) || 0;
 
   let availW, availH;
-  if (rot) {
+  if (rot || full) {
     // 自己转过 90°：元素盒子的宽高已经被换成 (视口高, 视口宽)，
     // 这时量 clientWidth 会拿到旋转前的旧值，必须用视口尺寸推算。
+    // 全屏同理：取景要吃满整屏，不按文档流里剩下的高度算。
     const sp = appSpace();
     availW = sp.w - padL - padR;
     availH = sp.h - padT - padB;
-    if (!land) {
+    if (!land && !full) {
       // 锁成竖屏但窗口是横的：顶栏/工具条/快门还在文档流里
       const appCs = getComputedStyle($('#app'));
       availH -= parseFloat(appCs.paddingTop) || 0;
@@ -944,11 +1043,12 @@ function layoutStage() {
   if (availW <= 0 || availH <= 0) return;
 
   // 取景框要尽量大：
-  //   竖屏：固定 3:4（手机竖着拿的取景习惯），画面用 cover 填满；
-  //   横屏：整块铺满 —— 顶栏、工具条、快门都是浮层，画面就是全屏。
+  //   竖屏非全屏：固定 3:4（手机竖着拿的取景习惯），cover 填满；
+  //   横屏 / 全屏：整块铺满 —— 顶栏、工具条、快门都是浮层或独立一行，
+  //               画面能吃多少给多少。
   // 注意不是「按视频流比例排版」：那会让 4:3 的流在竖屏里缩成一条矮带。
   let w, h;
-  if (land) {
+  if (land || full) {
     w = availW;
     h = availH;
   } else {
@@ -1027,13 +1127,18 @@ function renderOverlay() {
   if (S.autoInk) {
     try { ink = sampleVideoInk(pos); } catch (e) { ink = 'dark'; }
   }
-  // 横屏是全屏取景，顶栏和快门都是浮层压在画面上。
-  // 水印贴角会正好被它们盖住，所以整体让开一段：贴顶的往下让顶栏，
-  // 贴底的往上让快门条。竖屏不受影响（工具条在画面之外）。
+  // 什么时候水印要给界面让位？
+  //   · 全屏：顶栏、工具条、快门全是浮层，压在画面上；
+  //   · 横屏：工具条浮在画面左上、快门条也在画面下方。
+  // 这两种情况贴角的水印会被压住，所以整体往画面里让一段。
+  // 竖屏非全屏时工具条在画面之外，不用让。
   ctx.save();
-  if (isLandscape()) {
-    const shift = isTopPos(pos) ? 42 : -78;
-    ctx.translate(0, shift);
+  if (S.full || isLandscape()) {
+    const topEl = $('.topbar'), botEl = $('.controls');
+    const topH = S.full && topEl ? topEl.offsetHeight : 0;
+    const botH = (S.full || isLandscape()) && botEl ? botEl.offsetHeight : 0;
+    const shift = isTopPos(pos) ? topH + 12 : -(botH + 10);
+    if (shift) ctx.translate(0, shift);
   }
   WM.draw(ctx, W, H, d, { style: S.style, pos, scale: S.wmScale, ink, s: S });
   ctx.restore();
@@ -2492,6 +2597,11 @@ function syncTools() {
     ob.title = orient.auto ? '方向：自动' : '方向：已锁定';
     ob.classList.toggle('on', !orient.auto);
   }
+  const fb = document.getElementById('btnFull');
+  if (fb) {
+    fb.title = S.full ? '退出全屏' : '全屏取景';
+    fb.classList.toggle('on', !!S.full);
+  }
 }
 
 async function fillFingerprint() {
@@ -2648,6 +2758,12 @@ function bindUI() {
       setOrientAuto(true);
     }
   });
+  // 全屏取景：只能手动开，退出用右上角的浮动按钮（或再点一次顶栏按钮）
+  const bf = $('#btnFull');
+  if (bf) bf.addEventListener('click', () => setFull(!S.full));
+  const bx = $('#btnExitFull');
+  if (bx) bx.addEventListener('click', (e) => { e.stopPropagation(); setFull(false); });
+
   $('#lensBar').addEventListener('click', e => {
     const b = e.target.closest('.lens');
     if (b) setLens(Number(b.dataset.i));
@@ -2764,6 +2880,8 @@ function boot() {
   syncUI();
   initLevel();
   initOrientation();
+  document.body.classList.toggle('full', !!S.full);
+  applyOrientation();
   initGeo();
   // 先用 60fps 的默认值开流，别让用户干等刷新率测完
   startCamera();

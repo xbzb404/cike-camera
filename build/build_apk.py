@@ -37,8 +37,8 @@ WWW = ROOT / "www"
 BUILD = ROOT / "build"
 
 APP_NAME = "此刻相机"
-DEFAULT_CODE = 15
-DEFAULT_NAME = "1.4.7"
+DEFAULT_CODE = 16
+DEFAULT_NAME = "1.4.8"
 
 # 本地签名材料（都已 gitignore）
 KEYSTORE = BUILD / "wmc.keystore"
@@ -95,8 +95,9 @@ def patch_manifest_attr(data, elem_name, attr_name, value):
 
     壳的原作者把 Activity 钉死在竖屏（screenOrientation=1）：窗口不转，
     WebView 就永远按竖屏出画面，横屏只能自己 CSS 转 90°，摄像头给的还是
-    竖版的流 —— 取景框怎么调都只是「一条竖带」。改成 13（fullUser）后
-    系统会真的转窗口，摄像头、布局、EXIF 全部跟着转，这才是正路。
+    竖版的流 —— 取景框怎么调都只是「一条竖带」。现在改成 4（sensor）
+    让系统真的转窗口（同样不受系统「自动旋转」开关限制，但不含倒置竖屏），
+    摄像头、布局、EXIF 全部跟着转，这才是正路。
     它的 configChanges 里本来就带了 orientation|screenSize|smallestScreenSize，
     所以旋转不会重建 Activity。"""
     buf = bytearray(data)
@@ -261,7 +262,13 @@ def pack(version_code, version_name, out_path):
     manifest = (SHELL / "AndroidManifest.xml").read_bytes()
     manifest = patch_manifest(manifest, version_code, version_name)
     # 13 = fullUser：跟随系统旋转（也尊重系统的「旋转锁定」开关）
-    manifest = patch_manifest_attr(manifest, "activity", "screenOrientation", 13)
+    # 10 = SCREEN_ORIENTATION_FULL_SENSOR：四个方向全跟随重力，而且
+    # **无视系统里的「自动旋转」开关**。之前用的 13（fullUser）会尊重
+    # 用户锁，手机横过来窗口也不动 —— 于是界面只能自己 CSS 转，摄像头
+    # 还是竖版的流，就是「横屏 UI 倒了、视角没转」那一堆问题的总根。
+    # 用 4（SENSOR）而不是 10：SENSOR 同样无视旋转锁，但不含「倒置竖屏」，
+    # 拍照时手一歪不会突然整屏翻转 180°。
+    manifest = patch_manifest_attr(manifest, "activity", "screenOrientation", 4)
 
     if out_path.exists():
         out_path.unlink()
