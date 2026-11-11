@@ -37,8 +37,8 @@ WWW = ROOT / "www"
 BUILD = ROOT / "build"
 
 APP_NAME = "此刻相机"
-DEFAULT_CODE = 22
-DEFAULT_NAME = "1.5.4"
+DEFAULT_CODE = 23
+DEFAULT_NAME = "1.5.5"
 
 # 本地签名材料（都已 gitignore）
 KEYSTORE = BUILD / "wmc.keystore"
@@ -332,13 +332,18 @@ def pack(version_code, version_name, out_path):
     manifest = (SHELL / "AndroidManifest.xml").read_bytes()
     manifest = patch_manifest(manifest, version_code, version_name)
     # 13 = fullUser：跟随系统旋转（也尊重系统的「旋转锁定」开关）
-    # 10 = SCREEN_ORIENTATION_FULL_SENSOR：四个方向全跟随重力，而且
-    # **无视系统里的「自动旋转」开关**。之前用的 13（fullUser）会尊重
-    # 用户锁，手机横过来窗口也不动 —— 于是界面只能自己 CSS 转，摄像头
-    # 还是竖版的流，就是「横屏 UI 倒了、视角没转」那一堆问题的总根。
-    # 用 4（SENSOR）而不是 10：SENSOR 同样无视旋转锁，但不含「倒置竖屏」，
-    # 拍照时手一歪不会突然整屏翻转 180°。
-    manifest = patch_manifest_attr(manifest, "activity", "screenOrientation", 4)
+    # 1 = SCREEN_ORIENTATION_PORTRAIT：窗口钉死竖屏，系统**永远不转 Activity**。
+    #
+    # 1.5.4 及以前用的是 4（SENSOR），让系统真的把窗口转过去。代价是：转一次
+    # 手机 = Activity 配置变更 + WebView 重新 resize + 整棵树重排，低端机上
+    # 一定会看到「卡一下」；而且系统旋转动画和 WebView 重排各转一次，观感
+    # 上就是「转了两次」。
+    #
+    # 现在改成锁竖屏，横屏由网页层自己做：#app 整体 rotate(±90deg)（纯 GPU
+    # 合成），界面按 873×393 的逻辑空间重新排版，用户横着拿手机看就是横屏。
+    # 窗口一寸不动 → 没有 resize、没有摄像头重新协商、没有二次旋转。
+    # configChanges 里本来就带 orientation|screenSize，即便系统想转也不重建。
+    manifest = patch_manifest_attr(manifest, "activity", "screenOrientation", 1)
 
     if out_path.exists():
         out_path.unlink()

@@ -25,7 +25,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const pad2 = n => String(n).padStart(2, '0');
 
-const APP_VERSION = '1.5.4';
+const APP_VERSION = '1.5.5';
 const LS_KEY = 'wmc.settings.v3';
 const OLD_KEYS = ['wmc.settings.v2', 'wmc.settings.v1'];
 
@@ -236,7 +236,8 @@ function grabPoster() {
   if (!video.videoWidth || !video.videoHeight) return;
   // 手动指定过画面旋转的机型，这里的坐标换算容易出错，直接放弃抓帧，
   // 退回纯色底（总比 WebView 的播放按钮好看）
-  if (videoRotDeg()) return;
+  // 自己转过 90° 时也一样：抓到的是未旋转的帧，贴上去会躺倒。
+  if (videoRotDeg() || selfRot) return;
 
   // 只抓「画面」那一块，不是整张卡片：视野选完整时上下有留边，
   // 把留边也抓进去会让静态帧看起来比实时画面更宽。
@@ -505,14 +506,16 @@ function videoRotDeg() {
     const n = Number(S.videoRot);
     return (n === 90 || n === 270) ? n : 0;
   }
+  // 锁竖屏后横屏是靠 #app 整体 rotate(±90deg) 实现的，画面已经跟着转了。
+  // 这里再转一次就是「转了两次」（用户报的正是这个），所以直接返回 0。
+  if (selfRot) return 0;
   // 自动 = 信任 WebView 的 display rotation（Android 上它会把 sensor 帧转到
   // 屏幕方向再交给 <video>），绝大多数机型这里什么都不用做。
   //
   // 唯一例外：横屏时拿到的流仍然是竖的（videoHeight > videoWidth），说明这台
-  // WebView 没跟显示方向走 —— 画面在宽取景框里会被 cover 拉成中间一条竖带，
-  // 看起来就是「视角根本没切换」。以前遇到这种情况会对调宽高**重开摄像头**，
-  // 那是横屏闪屏 + 低端机卡顿的根源；现在直接给画面转 90°（纯 GPU 合成，
-  // 不碰流、不重新协商、不掉帧）。
+  // WebView 没跟显示方向走 —— 画面在宽取景框里会被 cover 拉成中间一条竖带。
+  // 以前遇到这种情况会对调宽高**重开摄像头**，那是横屏闪屏 + 低端机卡顿的
+  // 根源；现在直接给画面转 90°（纯 GPU 合成，不碰流、不重新协商、不掉帧）。
   const vw = video.videoWidth, vh = video.videoHeight;
   if (vw && vh && vh > vw) {
     const W = stage.clientWidth, H = stage.clientHeight;
@@ -795,13 +798,27 @@ async function applyZoom(z) {
   }
 }
 
+/* 屏幕坐标 → 取景框本地坐标。
+   自己转过 90° 时 stage 的包围盒是「宽高互换」的，直接用 clientX-left
+   拿到的是旋转后的偏移，对焦点会跑到画面对角去。用归一化比例反推最稳：
+   屏幕上的相对位置 (u,v) 与本地 (x,y) 在 90° 旋转下是线性互换的。 */
+function stageLocal(ev) {
+  const r = stage.getBoundingClientRect();
+  const W = stage.clientWidth, H = stage.clientHeight;
+  if (!selfRot) return { x: ev.clientX - r.left, y: ev.clientY - r.top };
+  const u = r.width ? (ev.clientX - r.left) / r.width : 0;
+  const v = r.height ? (ev.clientY - r.top) / r.height : 0;
+  // rotate(90)：本地原点落在屏幕右上角 → 屏幕 x 增大 = 本地 y 减小
+  if (selfRot === 90) return { x: v * W, y: (1 - u) * H };
+  return { x: (1 - v) * W, y: u * H };
+}
+
 /* ---------- 触控对焦 ---------- */
 stage.addEventListener('click', e => {
   if (!trackRef) return;
-  const r = stage.getBoundingClientRect();
+  const p = stageLocal(e);
   const fr = frameRect();
-  const px = e.clientX - r.left;
-  const py = e.clientY - r.top;
+  const px = p.x, py = p.y;
   // 点在留边上时按最近的画面边界算，别把归一化坐标算出 [0,1] 之外
   const x = Math.min(1, Math.max(0, (px - fr.x) / fr.w));
   const y = Math.min(1, Math.max(0, (py - fr.y) / fr.h));
@@ -926,16 +943,17 @@ const orient = {
 
 /* 原生方向锁（壳里的 WMCAndroid.setOrientation）。
    ------------------------------------------------------------
-   1.5.3 之前「锁定」只是网页层不再听陀螺仪 —— 可窗口是 fullSensor，
-   系统照样把窗口转过去，我们只能 CSS 反向转 90° 把界面「摆正」。
-   结果就是用户看到的：明明锁了，转手机整个界面跟着倒，还闪一下重排。
+   1.5.5 起壳清单本身就是 screenOrientation=1（竖屏），启动时再调一次
+   1 把它钉牢（个别 ROM 会缓存清单里的旧值）。
 
-   真正锁死只能回到原生：Activity.setRequestedOrientation()。
+   为什么不像以前那样用 4（SENSOR）让系统转窗口：那等于每转一次手机就
+   让 Activity 重新配置 + WebView 重新 resize + 整棵树重排，低端机必卡；
+   而且系统旋转动画和 WebView 重排各算一次，观感就是「转了两次」。
+   现在是「窗口一动不动，只把 UI 转 90°」—— 纯 GPU 合成，没有重排风暴。
+
    （WebView 里的 screen.orientation.lock() 是死路 —— Chromium 明确表示
-   安卓 WebView 不支持，调用必抛异常。）
-     14 = SCREEN_ORIENTATION_LOCKED  钉在「当前这个方向」，转手机窗口不动
-      4 = SCREEN_ORIENTATION_SENSOR  恢复跟随重力（壳清单里的默认值）
-   浏览器里预览没有这个桥，返回 false，退回下面那段 CSS 自转兜底。 */
+   安卓 WebView 不支持，调用必抛异常。） */
+const ORIENT_PORTRAIT = 1;
 const ORIENT_LOCKED = 14;
 const ORIENT_SENSOR = 4;
 function nativeOrient(v) {
@@ -959,15 +977,18 @@ function deviceLand() { return orient.q === 90 || orient.q === -90; }
 
 /* 目标方向。
    ------------------------------------------------------------
-   关键：**窗口方向永远优先**。壳是 fullSensor，系统自己会转窗口，
-   而且它比我们晚 3 帧的陀螺仪读数更可靠。只有「陀螺仪说转了、窗口
-   还没转」这个过渡态（pendLand）才听传感器的 —— 那是给自己留的
-   兜底，用来在个别不转窗口的 ROM 上手动 CSS 转 90°。
-   以前这里让传感器盖过窗口，结果系统刚转完、陀螺仪还是旧值时，
-   界面又被反向转回去，就成了「UI 倒过来」。 */
+   1.5.5 起壳是 screenOrientation=1（锁竖屏）：**窗口永远不会转**，
+   所以「现在该不该按横屏排版」只能问陀螺仪。
+
+   这是用户明确要的「只有 UI 转」：转手机时 Activity 不动、WebView 不
+   resize、摄像头不重新协商，只有 #app 自己 rotate(±90deg)（纯 GPU 合成）。
+   以前让系统转窗口，等于每转一次手机就重新布局整棵树，低端机必卡；
+   而且系统动画和 WebView 重排各转一次，看起来就是「转了两次」。
+
+   浏览器里预览（没有原生壳）时窗口会自己转，那里继续以窗口为准。 */
 function targetLand() {
   if (!orient.auto) return orient.lockedQ === 90 || orient.lockedQ === -90;
-  if (pendLand !== null) return pendLand;
+  if (window.WMCAndroid) return deviceLand();
   return winLand();
 }
 
@@ -1019,22 +1040,24 @@ function applyOrientation(opts) {
   const gyro = !!(opts && opts.gyro);
   const want_land = targetLand();
 
-  // 自己转的角度：只有「目标方向和窗口方向不一致」时才需要转
+  // 自己转的角度：只有「目标方向和窗口方向不一致」时才需要转。
+  // 壳锁竖屏时窗口恒为竖，设备一横就会走到这里。
   let want = 0;
   if (want_land !== winLand()) {
-    const q = (orient.q === 90 || orient.q === -90) ? orient.q : 90;
-    // 设备横着、窗口还竖着 → 按重力方向转 ±90（截图验证过：方向取反就会
-    // 上下颠倒）。窗口横、目标竖（少见）→ 反过来转。
+    // 锁定时用锁存的角度，不用当前陀螺仪读数 —— 否则锁定期间任何一次
+    // resize 都会按手机的新姿态把界面又转过去。
+    const q = orient.auto
+      ? ((orient.q === 90 || orient.q === -90) ? orient.q : 90)
+      : orient.lockedQ;
+    // 符号取 q 本身（截图验证过：取反就上下颠倒）。
+    // q 来自 angleFromGravity，已经带着「设备往哪边倒」的符号。
     want = want_land ? q : -q;
   }
 
-  // 陀螺仪先报「横了」，窗口可能下一帧才转。这时候立刻自己转 90° 就会
-  // 出现「先闪一下转过去、再被系统转回来」的双重旋转，看起来又闪又卡。
-  // 壳是 SCREEN_ORIENTATION_SENSOR，系统一定会自己转窗口，所以这里把等待
-  // 拉长到 900ms：只要系统在 0.9 秒内转了（正常机型 100~300ms），resize 一来
-  // 就把定时器清掉，CSS 自转这条路根本不会走到 —— 界面上一次旋转都看不到。
-  // 900ms 还没转，才说明这台 ROM 确实不给转窗口，再用 CSS 兜底。
-  if (gyro && want !== selfRot) {
+  // 有原生壳时窗口被钉死，不存在「系统还没转完」的过渡态，陀螺仪认了
+  // 就直接转，一帧都不等。只有浏览器预览（窗口会自己转）才需要等 900ms，
+  // 免得自己转一次、系统再转一次。
+  if (gyro && want !== selfRot && !window.WMCAndroid) {
     clearTimeout(rotTimer);
     rotTimer = setTimeout(() => { rotTimer = 0; applyOrientation(); }, 900);
     return;
@@ -1073,7 +1096,9 @@ function applyOrientation(opts) {
 
   // 旋转会改变可用宽高，等一帧再排。只有横竖状态**真的变了**才挂
   // .layout-anim：软键盘、地址栏之类的 resize 每次都带动画反而更卡。
-  scheduleLayout(prevKey !== nextKey || !!(opts && opts.anim));
+  // 自转（selfRot）时不给控件加过渡 —— #app 整体已经瞬间转了 90°，
+  // 控件再来一段位移/淡入只会变成「转完又飘一下」，低端机上还多一帧重绘。
+  scheduleLayout((prevKey !== nextKey || !!(opts && opts.anim)) && !want);
 
   // 横屏后如果摄像头给的还是竖版的流，补一次画面校正。
   // 这里只是重新算 CSS transform，不重开流 —— 以前这里延迟 420ms 调
@@ -1182,21 +1207,15 @@ function setOrientAuto(on) {
   clearTimeout(rotTimer);
   rotTimer = 0;
   if (!on) {
-    // 锁的是「现在看到的这个方向」。判断依据是窗口（= 用户眼睛里的画面），
-    // 不是陀螺仪读数 —— 手机平放时读数是 0，会把横屏锁成竖屏。
-    orient.lockedQ = winLand() ? 90 : 0;
-    nativeOrient(ORIENT_LOCKED);
-    toast('已锁定：' + (orient.lockedQ ? '横屏' : '竖屏') + '（屏幕已钉死，转手机不再跟随）');
+    // 锁的是「现在看到的这个方向」。壳锁竖屏后窗口恒为竖，所以判断依据
+    // 是 selfRot（我们自己转了多少），不是 window.innerWidth/Height。
+    orient.lockedQ = logicalLand ? (selfRot || 90) : 0;
+    toast('已锁定：' + (orient.lockedQ ? '横屏' : '竖屏') + '（转手机不再跟随）');
   } else {
-    nativeOrient(ORIENT_SENSOR);
-    // 解锁瞬间设备可能已经横着、而窗口还钉在竖屏（原生锁刚放开）。
-    // 给兜底逻辑一个「设备转了、窗口没转」的初始状态：系统随后自己
-    // 转窗口时会清掉 pendLand，不会出现双重旋转。
-    pendLand = deviceLand() === winLand() ? null : deviceLand();
     toast('已恢复自动旋转');
   }
   document.body.classList.toggle('orient-lock', !on);
-  applyOrientation({ gyro: !on && pendLand !== null });
+  applyOrientation();
   syncTools();
 }
 
@@ -2017,12 +2036,17 @@ function rotateSource(src, deg) {
  * 预览里看到什么（含画面方向、前置镜像、变焦裁切、比例裁切），成片就是什么
  */
 function composeCanvas(raw) {
-  // 预览的「自动转 90°」只在流本身是竖的（WebView 没跟显示方向）时才生效。
-  // 成片那张源图可能已经是横的（grabHiRes 重新协商过），这时候再转就把
-  // 照片转倒了 —— 所以先在源图上判断，只有它也是竖的才跟预览一起转。
+  // 预览的旋转有两条来源：
+  //   ① selfRot —— #app 整体转了 90°（锁竖屏方案的横屏），成片必须跟着转，
+  //      否则预览是正的、拍出来是躺的；
+  //   ② videoRotDeg —— 单独的流方向校正（只有窗口真的横了才会走到）。
+  // 成片源图可能已经是横的（grabHiRes 重新协商过），那时别再套 ②。
   const manual = !!(S.videoRot && S.videoRot !== 'auto');
   const srcLand = raw.w && raw.h && raw.w > raw.h;
-  const rot = (!manual && srcLand) ? 0 : videoRotDeg();
+  let rot;
+  if (manual) rot = videoRotDeg();
+  else if (selfRot) rot = selfRot;
+  else rot = srcLand ? 0 : videoRotDeg();
   if (rot) {
     const r = rotateSource(raw.src, rot);
     raw = Object.assign({}, raw, { src: r.src, w: r.w, h: r.h });
@@ -3148,6 +3172,22 @@ function boot() {
   bindUI();
   syncUI();
   initLevel();
+  // 浮层原本挂在 <body> 下。锁竖屏方案的横屏是 #app 整体转 90°，挂在
+  // body 上的浮层不会跟着转 —— 横着拿手机时，样式面板、图库、预览、
+  // toast 全是侧躺的。挪进 #app：带 transform 的祖先会成为 fixed 子元素
+  // 的包含块，浮层自动按逻辑坐标（873×393）铺满，方向和界面一致。
+  (function adoptOverlays() {
+    const app = document.getElementById('app');
+    if (!app) return;
+    ['sheetMask', 'sheet', 'styleMask', 'styleSheet',
+     'galleryMask', 'gallery', 'preview', 'toast'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el && el.parentNode !== app) app.appendChild(el);
+    });
+  })();
+  // 窗口钉死竖屏：横屏完全交给网页层的 CSS 旋转，系统不参与。
+  // 这样转手机不会触发 Activity 旋转 / WebView resize / 摄像头重新协商。
+  nativeOrient(ORIENT_PORTRAIT);
   initOrientation();
   // 多摄：读回上次学到的焦距（哪颗是 0.5×、哪颗是主摄）
   loadLensFocal();

@@ -195,6 +195,57 @@ function ok(cond, name, extra) {
     await c.close();
   }
 
+  /* ---------- 四、锁竖屏 + 自转横屏：成片方向要跟预览一致 ---------- */
+  {
+    const c = await b.newContext({
+      viewport: { width: 393, height: 873 }, deviceScaleFactor: 2.75,
+      permissions: ['camera', 'geolocation'],
+      geolocation: { latitude: 32.06, longitude: 118.77, accuracy: 8 }
+    });
+    const p = await c.newPage();
+    const errs = [];
+    p.on('pageerror', e => errs.push(String(e)));
+    await p.addInitScript(() => {
+      window.__calls = [];
+      window.WMCAndroid = { setOrientation(v) { window.__calls.push(v); } };
+    });
+    await p.goto(URL, { waitUntil: 'load' });
+    await p.waitForTimeout(2400);
+
+    // 横放（gamma=90）
+    await p.evaluate(() => {
+      for (let i = 0; i < 6; i++) {
+        const e = new Event('deviceorientation');
+        Object.defineProperty(e, 'beta', { value: 0 });
+        Object.defineProperty(e, 'gamma', { value: 90 });
+        window.dispatchEvent(e);
+      }
+    });
+    await p.waitForTimeout(900);
+    const st = await p.evaluate(() => ({
+      land: document.body.classList.contains('land'),
+      selfrot: typeof selfRot !== 'undefined' ? selfRot : 0,
+      inner: [innerWidth, innerHeight]
+    }));
+    ok(st.land && st.selfrot !== 0, '横放后进入自转横屏', 'selfrot=' + st.selfrot);
+    ok(st.inner[0] === 393 && st.inner[1] === 873, '窗口尺寸没变（系统没转）',
+      st.inner.join('×'));
+
+    await p.evaluate(() => capture());
+    await p.waitForTimeout(3200);
+    const shot = await p.evaluate(async () => {
+      const blob = (typeof shotBlob !== 'undefined' && shotBlob)
+        || (typeof history !== 'undefined' && history[0] && history[0].blob);
+      if (!blob) return null;
+      const bmp = await createImageBitmap(blob);
+      return { w: bmp.width, h: bmp.height };
+    });
+    ok(shot && shot.w > shot.h, '横屏拍出来是横图（没有躺着）',
+      shot ? shot.w + '×' + shot.h : '没有拿到照片');
+    ok(errs.length === 0, '无 JS 报错', errs.join(' | '));
+    await c.close();
+  }
+
   await b.close();
   console.log(fail ? '\n失败 ' + fail + ' 项' : '\n全部通过');
   process.exit(fail ? 1 : 0);
